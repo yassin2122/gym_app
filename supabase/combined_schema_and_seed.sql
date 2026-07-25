@@ -1,0 +1,7184 @@
+-- ==========================================
+-- MIGRATION: 000001_extensions.sql
+-- ==========================================
+-- Extensions used throughout this schema.
+--
+-- pgcrypto:   gen_random_uuid() for every table's primary key default.
+-- pg_trgm:    trigram similarity indexes for fuzzy/typo-tolerant search
+--             on exercise names and aliases.
+-- unaccent:   strips accents in search input ("bíceps" matches "biceps")
+--             — cheap to add now, meaningfully improves search recall
+--             for a dataset with international exercise names.
+create extension if not exists pgcrypto;
+create extension if not exists pg_trgm;
+create extension if not exists unaccent;
+
+
+-- ==========================================
+-- MIGRATION: 000002_profiles.sql
+-- ==========================================
+-- Design note: this schema deliberately has NO `public.users` table.
+-- Supabase's `auth.users` already IS the users table — creating a
+-- second one duplicates identity and is a common anti-pattern. Every
+-- reference to "the user" elsewhere in this schema is a foreign key to
+-- `public.profiles.id`, which is itself a 1:1 extension of `auth.users`.
+
+create table public.profiles (
+  id uuid primary key references auth.users (id) on delete cascade,
+  username text unique,
+  display_name text,
+  avatar_url text,
+  is_guest boolean not null default false,
+  date_of_birth date,
+  gender text check (gender in ('male', 'female', 'other', 'prefer_not_to_say')),
+  height_cm numeric check (height_cm is null or height_cm > 0),
+  experience_level text check (experience_level in ('beginner', 'intermediate', 'advanced')),
+  primary_goal text check (primary_goal in ('build_muscle', 'lose_weight', 'improve_strength', 'improve_endurance', 'general_fitness')),
+  unit_preference text not null default 'metric' check (unit_preference in ('metric', 'imperial')),
+  onboarding_completed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+comment on table public.profiles is
+  'App-specific profile data, 1:1 with auth.users. This is "the users table" for every other FK in this schema — see the design note above for why there is no separate public.users.';
+
+create index profiles_username_idx on public.profiles (username) where username is not null;
+
+-- One row per user, holding app behavior settings rather than identity.
+-- Split from `profiles` because these change far more often via a
+-- Settings screen and have a completely different access pattern (one
+-- row read on app start, occasionally updated) than identity data.
+create table public.user_preferences (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null unique references public.profiles (id) on delete cascade,
+  rest_timer_default_seconds integer not null default 90 check (rest_timer_default_seconds > 0),
+  rest_timer_sound_enabled boolean not null default true,
+  haptics_enabled boolean not null default true,
+  notifications_enabled boolean not null default true,
+  weekly_workout_goal integer check (weekly_workout_goal is null or weekly_workout_goal between 1 and 14),
+  week_start_day smallint not null default 1 check (week_start_day between 0 and 6), -- 0=Sunday
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+comment on table public.user_preferences is
+  'App behavior settings, split from profiles because it changes independently and has a different read pattern (fetched once per session, not joined into every user-facing query).';
+
+-- Point-in-time body measurements. Separate from weight_history because
+-- these are logged far less frequently (weekly/monthly vs. daily) and
+-- have a completely different shape (many optional measurement fields
+-- vs. a single required weight value) — one flexible table for both
+-- would mean nullable columns dominating either use case.
+create table public.body_measurements (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  measured_at date not null default current_date,
+  chest_cm numeric check (chest_cm is null or chest_cm > 0),
+  waist_cm numeric check (waist_cm is null or waist_cm > 0),
+  hips_cm numeric check (hips_cm is null or hips_cm > 0),
+  bicep_cm numeric check (bicep_cm is null or bicep_cm > 0),
+  thigh_cm numeric check (thigh_cm is null or thigh_cm > 0),
+  calf_cm numeric check (calf_cm is null or calf_cm > 0),
+  neck_cm numeric check (neck_cm is null or neck_cm > 0),
+  body_fat_percentage numeric check (body_fat_percentage is null or body_fat_percentage between 0 and 100),
+  notes text,
+  created_at timestamptz not null default now()
+);
+
+create index body_measurements_user_date_idx on public.body_measurements (user_id, measured_at desc);
+
+-- High-frequency weight log — the Dashboard body weight graph's source.
+create table public.weight_history (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  weight_kg numeric not null check (weight_kg > 0),
+  logged_at timestamptz not null default now(),
+  note text,
+  created_at timestamptz not null default now()
+);
+
+create index weight_history_user_logged_idx on public.weight_history (user_id, logged_at desc);
+
+-- Auto-create a profile row whenever a new auth.users row appears
+-- (covers real sign-up and anonymous/guest sign-in). Uses dynamic
+-- (to_jsonb) extraction of is_anonymous rather than static field access
+-- — see the original Sprint 1 hardening notes in DATABASE.md for why:
+-- a static NEW.is_anonymous reference breaks account creation entirely
+-- on any Supabase/GoTrue schema variant where that column is absent.
+create function public.handle_new_auth_user()
+returns trigger
+language plpgsql
+security definer set search_path = public
+as $$
+begin
+  insert into public.profiles (id, is_guest)
+  values (
+    new.id,
+    coalesce((to_jsonb(new) ->> 'is_anonymous')::boolean, false)
+  );
+  insert into public.user_preferences (user_id) values (new.id);
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_auth_user();
+
+
+-- ==========================================
+-- MIGRATION: 000003_reference_tables.sql
+-- ==========================================
+-- Reference/lookup tables. Kept as real tables (not a CHECK-constrained
+-- text enum) because each carries metadata beyond a name (body_region,
+-- equipment category, display ordering) and because new values
+-- (a new equipment type, a new muscle) should be an INSERT, not a
+-- migration — exactly the kind of change that shouldn't require a
+-- schema change, per the "none of this should need redesign later"
+-- brief.
+
+create table public.muscle_groups (
+  id uuid primary key default gen_random_uuid(),
+  name text not null unique,
+  body_region text not null check (body_region in ('upper_body', 'lower_body', 'core', 'full_body')),
+  display_order integer not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create table public.equipment (
+  id uuid primary key default gen_random_uuid(),
+  name text not null unique,
+  equipment_category text not null check (
+    equipment_category in ('free_weight', 'machine', 'cable', 'bodyweight', 'accessory', 'cardio_machine')
+  ),
+  display_order integer not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create table public.exercise_categories (
+  id uuid primary key default gen_random_uuid(),
+  name text not null unique,
+  description text,
+  display_order integer not null default 0,
+  created_at timestamptz not null default now()
+);
+
+-- Free-form, many-to-many tags — distinct from the rigid categories
+-- above. Categories are a controlled taxonomy (one per exercise,
+-- curated); tags are open-ended (many per exercise, can grow without
+-- curation review) — e.g. "home-friendly", "compound", "unilateral".
+create table public.exercise_tags (
+  id uuid primary key default gen_random_uuid(),
+  name text not null unique,
+  created_at timestamptz not null default now()
+);
+
+create index muscle_groups_body_region_idx on public.muscle_groups (body_region);
+create index equipment_category_idx on public.equipment (equipment_category);
+
+
+-- ==========================================
+-- MIGRATION: 000004_exercises.sql
+-- ==========================================
+create table public.exercises (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  slug text not null unique,
+  description text,
+  category_id uuid references public.exercise_categories (id),
+
+  -- Broad classification, denormalized from category for fast filtering
+  -- without a join on the single most common filter (Exercise Library's
+  -- top-level type tabs). Kept in sync by a trigger when category_id
+  -- changes — see 000010_triggers.sql.
+  exercise_type text not null check (exercise_type in ('strength', 'cardio', 'mobility', 'calisthenics')),
+
+  movement_pattern text check (
+    movement_pattern in ('push', 'pull', 'squat', 'hinge', 'lunge', 'carry', 'rotation', 'isometric', 'other')
+  ),
+  mechanics text check (mechanics in ('compound', 'isolation')),
+  force text check (force in ('push', 'pull', 'static')),
+  difficulty text check (difficulty in ('beginner', 'intermediate', 'advanced')),
+
+  -- Denormalized from the exercise's primary muscle's body_region for
+  -- the same reason as exercise_type — body region is a top-level
+  -- Exercise Library filter and shouldn't require a join to every list
+  -- query. Kept in sync by trigger when exercise_muscles changes.
+  body_region text check (body_region in ('upper_body', 'lower_body', 'core', 'full_body')),
+
+  instructions text[] not null default '{}',
+  common_mistakes text[] not null default '{}',
+  tips text[] not null default '{}',
+
+  popularity integer not null default 0 check (popularity >= 0),
+  estimated_duration_seconds integer check (estimated_duration_seconds is null or estimated_duration_seconds > 0),
+  calorie_multiplier numeric check (calorie_multiplier is null or calorie_multiplier > 0),
+
+  is_custom boolean not null default false,
+  created_by uuid references public.profiles (id) on delete set null,
+
+  -- Maintained by trigger (see 000010_triggers.sql), not a generated
+  -- column — it needs to incorporate muscle/equipment names from
+  -- related tables, which a single-table GENERATED ALWAYS AS column
+  -- cannot reference.
+  search_vector tsvector,
+
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+comment on table public.exercises is
+  'The exercise library. exercise_type and body_region are intentionally denormalized from category/exercise_muscles for fast top-level filtering — see inline comments. Seeded from the free-exercise-db public domain dataset; see exercise_import/ for the pipeline.';
+
+create index exercises_category_idx on public.exercises (category_id);
+create index exercises_exercise_type_idx on public.exercises (exercise_type);
+create index exercises_body_region_idx on public.exercises (body_region);
+create index exercises_difficulty_idx on public.exercises (difficulty);
+create index exercises_search_vector_idx on public.exercises using gin (search_vector);
+create index exercises_name_trgm_idx on public.exercises using gin (name gin_trgm_ops);
+
+-- Alternate names a user might search for (e.g. "chin-up" as an alias
+-- for "pull-up"). Not populated from free-exercise-db this pass — that
+-- dataset doesn't provide aliases — schema is ready for curation.
+create table public.exercise_aliases (
+  id uuid primary key default gen_random_uuid(),
+  exercise_id uuid not null references public.exercises (id) on delete cascade,
+  alias text not null,
+  unique (exercise_id, alias)
+);
+create index exercise_aliases_alias_trgm_idx on public.exercise_aliases using gin (alias gin_trgm_ops);
+
+create table public.exercise_images (
+  id uuid primary key default gen_random_uuid(),
+  exercise_id uuid not null references public.exercises (id) on delete cascade,
+  url text not null,
+  display_order integer not null default 0,
+  created_at timestamptz not null default now()
+);
+create index exercise_images_exercise_idx on public.exercise_images (exercise_id, display_order);
+
+create table public.exercise_videos (
+  id uuid primary key default gen_random_uuid(),
+  exercise_id uuid not null references public.exercises (id) on delete cascade,
+  url text not null,
+  video_type text not null default 'demonstration' check (video_type in ('demonstration', 'tutorial')),
+  created_at timestamptz not null default now()
+);
+
+-- Many-to-many: an exercise has a primary muscle, secondary muscles, and
+-- stabilizers. Junction table with a role column rather than three
+-- separate array columns — a proper relational model that supports
+-- "find all exercises where quadriceps is a stabilizer" without any
+-- array-contains gymnastics, and keeps muscle_groups as the single
+-- source of truth for a muscle's metadata.
+create table public.exercise_muscles (
+  id uuid primary key default gen_random_uuid(),
+  exercise_id uuid not null references public.exercises (id) on delete cascade,
+  muscle_group_id uuid not null references public.muscle_groups (id),
+  role text not null check (role in ('primary', 'secondary', 'stabilizer')),
+  unique (exercise_id, muscle_group_id, role)
+);
+create index exercise_muscles_exercise_idx on public.exercise_muscles (exercise_id);
+create index exercise_muscles_muscle_role_idx on public.exercise_muscles (muscle_group_id, role);
+
+create table public.exercise_equipment (
+  id uuid primary key default gen_random_uuid(),
+  exercise_id uuid not null references public.exercises (id) on delete cascade,
+  equipment_id uuid not null references public.equipment (id),
+  is_required boolean not null default true,
+  unique (exercise_id, equipment_id)
+);
+create index exercise_equipment_exercise_idx on public.exercise_equipment (exercise_id);
+create index exercise_equipment_equipment_idx on public.exercise_equipment (equipment_id);
+
+create table public.exercise_tag_map (
+  exercise_id uuid not null references public.exercises (id) on delete cascade,
+  tag_id uuid not null references public.exercise_tags (id) on delete cascade,
+  primary key (exercise_id, tag_id)
+);
+
+-- Not populated from free-exercise-db this pass (no relationship data in
+-- that dataset) — schema is ready, population is a future curation task.
+create table public.exercise_progressions (
+  id uuid primary key default gen_random_uuid(),
+  exercise_id uuid not null references public.exercises (id) on delete cascade,
+  progression_exercise_id uuid not null references public.exercises (id) on delete cascade,
+  check (exercise_id <> progression_exercise_id),
+  unique (exercise_id, progression_exercise_id)
+);
+
+create table public.exercise_regressions (
+  id uuid primary key default gen_random_uuid(),
+  exercise_id uuid not null references public.exercises (id) on delete cascade,
+  regression_exercise_id uuid not null references public.exercises (id) on delete cascade,
+  check (exercise_id <> regression_exercise_id),
+  unique (exercise_id, regression_exercise_id)
+);
+
+create table public.exercise_alternatives (
+  id uuid primary key default gen_random_uuid(),
+  exercise_id uuid not null references public.exercises (id) on delete cascade,
+  alternative_exercise_id uuid not null references public.exercises (id) on delete cascade,
+  reason text check (reason in ('equipment_substitute', 'injury_substitute', 'difficulty_substitute')),
+  check (exercise_id <> alternative_exercise_id),
+  unique (exercise_id, alternative_exercise_id)
+);
+
+
+-- ==========================================
+-- MIGRATION: 000005_workouts.sql
+-- ==========================================
+create table public.workout_sessions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+
+  -- FK constraint added in 000006_templates.sql once workout_templates
+  -- exists — a forward reference, handled the standard way rather than
+  -- reordering migrations away from the requested numbering scheme.
+  workout_template_id uuid,
+
+  name text not null,
+  status text not null default 'in_progress' check (status in ('in_progress', 'completed', 'abandoned')),
+  started_at timestamptz not null default now(),
+  completed_at timestamptz,
+  last_activity_at timestamptz not null default now(),
+  duration_seconds integer check (duration_seconds is null or duration_seconds >= 0),
+
+  -- Cached, maintained by trigger on workout_sets changes (see
+  -- 000010_triggers.sql) — avoids summing every set on every History/
+  -- Dashboard read. See calculate_workout_volume() in 000009_functions.sql
+  -- for the calculation this trigger calls.
+  total_volume_kg numeric not null default 0 check (total_volume_kg >= 0),
+
+  notes text,
+  created_at timestamptz not null default now(),
+
+  check (status <> 'completed' or completed_at is not null),
+  check (completed_at is null or completed_at >= started_at)
+);
+
+comment on table public.workout_sessions is
+  'One row per performed (or in-progress) workout. last_activity_at drives resume/stale-session detection and offline sync conflict resolution (last-write-wins). total_volume_kg is a maintained cache, not authoritative — workout_sets is the source of truth.';
+
+create index workout_sessions_user_started_idx on public.workout_sessions (user_id, started_at desc);
+create index workout_sessions_user_status_idx on public.workout_sessions (user_id, status);
+create index workout_sessions_user_activity_idx on public.workout_sessions (user_id, last_activity_at desc);
+create index workout_sessions_template_idx on public.workout_sessions (workout_template_id);
+
+create table public.workout_session_exercises (
+  id uuid primary key default gen_random_uuid(),
+  workout_session_id uuid not null references public.workout_sessions (id) on delete cascade,
+  exercise_id uuid not null references public.exercises (id),
+  order_index integer not null,
+  status text not null default 'completed' check (status in ('completed', 'skipped', 'removed')),
+  notes text,
+  created_at timestamptz not null default now(),
+  unique (workout_session_id, order_index)
+);
+
+create index workout_session_exercises_session_idx on public.workout_session_exercises (workout_session_id, order_index);
+create index workout_session_exercises_exercise_idx on public.workout_session_exercises (exercise_id);
+
+create table public.workout_sets (
+  id uuid primary key default gen_random_uuid(),
+  workout_session_exercise_id uuid not null references public.workout_session_exercises (id) on delete cascade,
+  set_number integer not null,
+  weight_kg numeric check (weight_kg is null or weight_kg > 0),
+  reps integer not null check (reps > 0),
+  rpe numeric check (rpe is null or (rpe >= 0 and rpe <= 10)),
+  is_warmup boolean not null default false,
+  completed_at timestamptz not null default now(),
+  unique (workout_session_exercise_id, set_number)
+);
+
+create index workout_sets_session_exercise_idx on public.workout_sets (workout_session_exercise_id, set_number);
+
+comment on table public.workout_sets is
+  'The atomic unit of logged performance. Every derived statistic (personal_records, statistics_cache, exercise_history) is computable from this table — it is the ground truth if any cache ever needs to be rebuilt.';
+
+
+-- ==========================================
+-- MIGRATION: 000006_templates.sql
+-- ==========================================
+create table public.workout_templates (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references public.profiles (id) on delete cascade,
+  name text not null,
+  description text,
+  category text check (category in ('push_pull_legs', 'upper_lower', 'full_body', 'custom')),
+  is_public boolean not null default false,
+  estimated_duration_minutes integer check (estimated_duration_minutes is null or estimated_duration_minutes > 0),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+
+  -- A template is either a system template (user_id null, always
+  -- effectively public) or a user-owned one — is_public only means
+  -- something for a user-owned template. Prevents an ambiguous state
+  -- where a system template is marked private.
+  check (user_id is not null or is_public = true)
+);
+
+create index workout_templates_user_idx on public.workout_templates (user_id);
+create index workout_templates_category_idx on public.workout_templates (category);
+create index workout_templates_public_idx on public.workout_templates (is_public) where is_public = true;
+
+create table public.template_exercises (
+  id uuid primary key default gen_random_uuid(),
+  workout_template_id uuid not null references public.workout_templates (id) on delete cascade,
+  exercise_id uuid not null references public.exercises (id),
+  order_index integer not null,
+  target_sets integer check (target_sets is null or target_sets > 0),
+  target_reps_min integer check (target_reps_min is null or target_reps_min > 0),
+  target_reps_max integer check (target_reps_max is null or target_reps_max >= target_reps_min),
+  target_rpe numeric check (target_rpe is null or (target_rpe >= 0 and target_rpe <= 10)),
+  rest_seconds integer check (rest_seconds is null or rest_seconds > 0),
+  notes text,
+  unique (workout_template_id, order_index)
+);
+
+create index template_exercises_template_idx on public.template_exercises (workout_template_id, order_index);
+
+-- Exercise favorites. Deliberately scoped to exercises only (not
+-- templates/workouts) — that's the actual requested use case and the
+-- one every reviewed competitor app (Hevy, Strong) surfaces; adding a
+-- polymorphic favorites table for hypothetical future favoritable types
+-- would be exactly the premature generalization the brief warns against.
+create table public.favorites (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  exercise_id uuid not null references public.exercises (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  unique (user_id, exercise_id)
+);
+
+create index favorites_user_idx on public.favorites (user_id, created_at desc);
+
+-- Deferred FK from 000005_workouts.sql, now that workout_templates exists.
+alter table public.workout_sessions
+  add constraint workout_sessions_template_fk
+  foreign key (workout_template_id) references public.workout_templates (id) on delete set null;
+
+
+-- ==========================================
+-- MIGRATION: 000007_statistics.sql
+-- ==========================================
+-- Every table in this file is a cache. workout_sets (000005) is always
+-- the source of truth; these exist purely so Dashboard/Statistics/
+-- History reads don't have to aggregate the full sets history on every
+-- request. All are kept current by triggers in 000010_triggers.sql
+-- calling functions in 000009_functions.sql.
+
+create table public.personal_records (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  exercise_id uuid not null references public.exercises (id),
+  record_type text not null check (record_type in ('max_weight', 'max_reps', 'max_volume', 'estimated_1rm')),
+  value numeric not null check (value > 0),
+  unit text not null default 'kg',
+  workout_set_id uuid references public.workout_sets (id) on delete set null,
+  achieved_at timestamptz not null default now(),
+  unique (user_id, exercise_id, record_type)
+);
+
+create index personal_records_user_idx on public.personal_records (user_id);
+create index personal_records_exercise_idx on public.personal_records (exercise_id);
+
+-- Rollup of a user's history with one specific exercise — powers the
+-- Exercise Detail screen's "your history with this exercise" panel
+-- without scanning every past session.
+create table public.exercise_history (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  exercise_id uuid not null references public.exercises (id),
+  times_performed integer not null default 0 check (times_performed >= 0),
+  last_performed_at timestamptz,
+  best_weight_kg numeric check (best_weight_kg is null or best_weight_kg > 0),
+  best_reps integer check (best_reps is null or best_reps > 0),
+  best_volume_kg numeric check (best_volume_kg is null or best_volume_kg > 0),
+  updated_at timestamptz not null default now(),
+  unique (user_id, exercise_id)
+);
+
+create index exercise_history_user_idx on public.exercise_history (user_id, last_performed_at desc);
+create index exercise_history_exercise_idx on public.exercise_history (exercise_id);
+
+-- Pre-aggregated period statistics (week/month/all-time) — the
+-- Statistics screen's volume-trend chart and consistency numbers read
+-- from here, never from a live aggregation over months of sets.
+create table public.statistics_cache (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  period_type text not null check (period_type in ('week', 'month', 'all_time')),
+  period_start date not null,
+  total_workouts integer not null default 0 check (total_workouts >= 0),
+  total_volume_kg numeric not null default 0 check (total_volume_kg >= 0),
+  total_sets integer not null default 0 check (total_sets >= 0),
+  total_duration_seconds integer not null default 0 check (total_duration_seconds >= 0),
+  muscle_group_distribution jsonb not null default '{}'::jsonb,
+  computed_at timestamptz not null default now(),
+  unique (user_id, period_type, period_start)
+);
+
+create index statistics_cache_user_period_idx on public.statistics_cache (user_id, period_type, period_start desc);
+
+-- Single row per user — the numbers the Dashboard needs on every app
+-- open (streak, this week's count). One indexed row read instead of
+-- several aggregation queries every time the app launches.
+create table public.dashboard_cache (
+  user_id uuid primary key references public.profiles (id) on delete cascade,
+  current_streak_days integer not null default 0 check (current_streak_days >= 0),
+  longest_streak_days integer not null default 0 check (longest_streak_days >= 0),
+  workouts_this_week integer not null default 0 check (workouts_this_week >= 0),
+  last_workout_at timestamptz,
+  computed_at timestamptz not null default now()
+);
+
+
+-- ==========================================
+-- MIGRATION: 000008_views.sql
+-- ==========================================
+-- CRITICAL: every view below is declared `security_invoker = true`.
+-- Without this, a Postgres view runs with the view OWNER's privileges by
+-- default, which would silently bypass every RLS policy on the
+-- underlying tables — a serious security bug, not a style preference.
+-- security_invoker makes the view enforce RLS as the querying user,
+-- exactly like querying the base tables directly.
+
+create view public.dashboard_view
+  with (security_invoker = true) as
+select
+  p.id as user_id,
+  p.display_name,
+  coalesce(dc.current_streak_days, 0) as current_streak_days,
+  coalesce(dc.longest_streak_days, 0) as longest_streak_days,
+  coalesce(dc.workouts_this_week, 0) as workouts_this_week,
+  dc.last_workout_at,
+  ws.id as active_session_id,
+  ws.name as active_session_name,
+  ws.started_at as active_session_started_at
+from public.profiles p
+left join public.dashboard_cache dc on dc.user_id = p.id
+left join lateral (
+  select id, name, started_at
+  from public.workout_sessions
+  where user_id = p.id and status = 'in_progress'
+  order by started_at desc
+  limit 1
+) ws on true;
+
+create view public.history_view
+  with (security_invoker = true) as
+select
+  s.id as session_id,
+  s.user_id,
+  s.name,
+  s.status,
+  s.started_at,
+  s.completed_at,
+  s.duration_seconds,
+  s.total_volume_kg,
+  t.name as template_name,
+  count(distinct se.id) as exercise_count,
+  count(st.id) as set_count
+from public.workout_sessions s
+left join public.workout_templates t on t.id = s.workout_template_id
+left join public.workout_session_exercises se on se.workout_session_id = s.id and se.status <> 'removed'
+left join public.workout_sets st on st.workout_session_exercise_id = se.id
+group by s.id, t.name;
+
+create view public.exercise_history_view
+  with (security_invoker = true) as
+select
+  eh.user_id,
+  eh.exercise_id,
+  e.name as exercise_name,
+  e.slug as exercise_slug,
+  eh.times_performed,
+  eh.last_performed_at,
+  eh.best_weight_kg,
+  eh.best_reps,
+  eh.best_volume_kg
+from public.exercise_history eh
+join public.exercises e on e.id = eh.exercise_id;
+
+create view public.personal_records_view
+  with (security_invoker = true) as
+select
+  pr.id,
+  pr.user_id,
+  pr.exercise_id,
+  e.name as exercise_name,
+  e.slug as exercise_slug,
+  pr.record_type,
+  pr.value,
+  pr.unit,
+  pr.achieved_at,
+  s.started_at as achieved_in_session_at
+from public.personal_records pr
+join public.exercises e on e.id = pr.exercise_id
+left join public.workout_sets ws on ws.id = pr.workout_set_id
+left join public.workout_session_exercises wse on wse.id = ws.workout_session_exercise_id
+left join public.workout_sessions s on s.id = wse.workout_session_id;
+
+create view public.statistics_view
+  with (security_invoker = true) as
+select
+  user_id,
+  period_type,
+  period_start,
+  total_workouts,
+  total_volume_kg,
+  total_sets,
+  total_duration_seconds,
+  muscle_group_distribution,
+  computed_at
+from public.statistics_cache;
+
+create view public.favorite_exercises_view
+  with (security_invoker = true) as
+select
+  f.user_id,
+  f.created_at as favorited_at,
+  e.id as exercise_id,
+  e.name,
+  e.slug,
+  e.exercise_type,
+  e.difficulty
+from public.favorites f
+join public.exercises e on e.id = f.exercise_id;
+
+
+-- ==========================================
+-- MIGRATION: 000009_functions.sql
+-- ==========================================
+-- ============================================================
+-- calculate_workout_volume — total kg lifted in a session,
+-- excluding warmup sets. Pure read, no side effects.
+-- ============================================================
+create or replace function public.calculate_workout_volume(p_session_id uuid)
+returns numeric
+language sql
+stable
+as $$
+  select coalesce(sum(ws.weight_kg * ws.reps), 0)
+  from public.workout_sets ws
+  join public.workout_session_exercises wse on wse.id = ws.workout_session_exercise_id
+  where wse.workout_session_id = p_session_id
+    and ws.is_warmup = false
+    and ws.weight_kg is not null;
+$$;
+
+-- ============================================================
+-- update_personal_record — checks one newly-logged set against
+-- the user's current records for that exercise and upserts
+-- personal_records if beaten. SECURITY DEFINER: personal_records
+-- is read-only to users via RLS (see 000011_policies.sql) —
+-- writes only happen here, called by the trigger in
+-- 000010_triggers.sql after every set insert.
+-- ============================================================
+create or replace function public.update_personal_record(p_set_id uuid)
+returns void
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  v_user_id uuid;
+  v_exercise_id uuid;
+  v_weight numeric;
+  v_reps integer;
+  v_volume numeric;
+  v_estimated_1rm numeric;
+begin
+  select s.user_id, wse.exercise_id, ws.weight_kg, ws.reps,
+         coalesce(ws.weight_kg, 0) * ws.reps
+  into v_user_id, v_exercise_id, v_weight, v_reps, v_volume
+  from public.workout_sets ws
+  join public.workout_session_exercises wse on wse.id = ws.workout_session_exercise_id
+  join public.workout_sessions s on s.id = wse.workout_session_id
+  where ws.id = p_set_id and ws.is_warmup = false;
+
+  if v_user_id is null then
+    return; -- warmup set or not found — no PR consideration
+  end if;
+
+  -- max_weight
+  if v_weight is not null then
+    insert into public.personal_records (user_id, exercise_id, record_type, value, unit, workout_set_id, achieved_at)
+    values (v_user_id, v_exercise_id, 'max_weight', v_weight, 'kg', p_set_id, now())
+    on conflict (user_id, exercise_id, record_type)
+    do update set value = excluded.value, workout_set_id = excluded.workout_set_id, achieved_at = excluded.achieved_at
+    where excluded.value > public.personal_records.value;
+  end if;
+
+  -- max_reps
+  insert into public.personal_records (user_id, exercise_id, record_type, value, unit, workout_set_id, achieved_at)
+  values (v_user_id, v_exercise_id, 'max_reps', v_reps, 'reps', p_set_id, now())
+  on conflict (user_id, exercise_id, record_type)
+  do update set value = excluded.value, workout_set_id = excluded.workout_set_id, achieved_at = excluded.achieved_at
+  where excluded.value > public.personal_records.value;
+
+  -- max_volume (single-set volume: weight * reps)
+  if v_weight is not null then
+    insert into public.personal_records (user_id, exercise_id, record_type, value, unit, workout_set_id, achieved_at)
+    values (v_user_id, v_exercise_id, 'max_volume', v_volume, 'kg', p_set_id, now())
+    on conflict (user_id, exercise_id, record_type)
+    do update set value = excluded.value, workout_set_id = excluded.workout_set_id, achieved_at = excluded.achieved_at
+    where excluded.value > public.personal_records.value;
+  end if;
+
+  -- estimated_1rm via the Epley formula: weight * (1 + reps/30).
+  -- A standard, well-documented estimation formula — not a fabricated
+  -- number — but still an estimate, surfaced to the user as such.
+  if v_weight is not null and v_reps > 0 then
+    v_estimated_1rm := v_weight * (1 + v_reps::numeric / 30);
+    insert into public.personal_records (user_id, exercise_id, record_type, value, unit, workout_set_id, achieved_at)
+    values (v_user_id, v_exercise_id, 'estimated_1rm', v_estimated_1rm, 'kg', p_set_id, now())
+    on conflict (user_id, exercise_id, record_type)
+    do update set value = excluded.value, workout_set_id = excluded.workout_set_id, achieved_at = excluded.achieved_at
+    where excluded.value > public.personal_records.value;
+  end if;
+end;
+$$;
+
+-- ============================================================
+-- update_exercise_history — rolls up a user's cumulative stats
+-- for one exercise after a set is logged. SECURITY DEFINER for
+-- the same reason as update_personal_record.
+-- ============================================================
+create or replace function public.update_exercise_history(p_set_id uuid)
+returns void
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  v_user_id uuid;
+  v_exercise_id uuid;
+begin
+  select s.user_id, wse.exercise_id
+  into v_user_id, v_exercise_id
+  from public.workout_sets ws
+  join public.workout_session_exercises wse on wse.id = ws.workout_session_exercise_id
+  join public.workout_sessions s on s.id = wse.workout_session_id
+  where ws.id = p_set_id;
+
+  if v_user_id is null then
+    return;
+  end if;
+
+  insert into public.exercise_history (user_id, exercise_id, times_performed, last_performed_at, best_weight_kg, best_reps, best_volume_kg, updated_at)
+  select
+    v_user_id,
+    v_exercise_id,
+    count(distinct wse.workout_session_id),
+    max(ws.completed_at),
+    max(ws.weight_kg),
+    max(ws.reps),
+    max(coalesce(ws.weight_kg, 0) * ws.reps),
+    now()
+  from public.workout_sets ws
+  join public.workout_session_exercises wse on wse.id = ws.workout_session_exercise_id
+  where wse.exercise_id = v_exercise_id
+    and wse.workout_session_id in (select id from public.workout_sessions where user_id = v_user_id)
+    and ws.is_warmup = false
+  on conflict (user_id, exercise_id)
+  do update set
+    times_performed = excluded.times_performed,
+    last_performed_at = excluded.last_performed_at,
+    best_weight_kg = excluded.best_weight_kg,
+    best_reps = excluded.best_reps,
+    best_volume_kg = excluded.best_volume_kg,
+    updated_at = now();
+end;
+$$;
+
+-- ============================================================
+-- update_statistics — recomputes week/month/all_time aggregates
+-- for a user. SECURITY DEFINER: statistics_cache is read-only to
+-- users via RLS.
+-- ============================================================
+create or replace function public.update_statistics(p_user_id uuid)
+returns void
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  v_period record;
+begin
+  for v_period in
+    select * from (values
+      ('week', date_trunc('week', now())::date),
+      ('month', date_trunc('month', now())::date),
+      ('all_time', date '1970-01-01')
+    ) as t(period_type, period_start)
+  loop
+    insert into public.statistics_cache (
+      user_id, period_type, period_start, total_workouts, total_volume_kg,
+      total_sets, total_duration_seconds, muscle_group_distribution, computed_at
+    )
+    with period_sessions as (
+      select id, total_volume_kg, duration_seconds
+      from public.workout_sessions
+      where user_id = p_user_id
+        and status = 'completed'
+        and (v_period.period_type = 'all_time' or started_at >= v_period.period_start)
+    ),
+    set_totals as (
+      select count(ws.id) as total_sets
+      from period_sessions ps
+      join public.workout_session_exercises wse on wse.workout_session_id = ps.id
+      join public.workout_sets ws on ws.workout_session_exercise_id = wse.id
+    ),
+    muscle_dist as (
+      select mg.name, count(*) as cnt
+      from period_sessions ps
+      join public.workout_session_exercises wse on wse.workout_session_id = ps.id
+      join public.exercise_muscles em on em.exercise_id = wse.exercise_id and em.role = 'primary'
+      join public.muscle_groups mg on mg.id = em.muscle_group_id
+      group by mg.name
+    )
+    select
+      p_user_id,
+      v_period.period_type,
+      v_period.period_start,
+      (select count(*) from period_sessions),
+      (select coalesce(sum(total_volume_kg), 0) from period_sessions),
+      (select coalesce(total_sets, 0) from set_totals),
+      (select coalesce(sum(duration_seconds), 0) from period_sessions),
+      (select coalesce(jsonb_object_agg(name, cnt), '{}'::jsonb) from muscle_dist),
+      now()
+    on conflict (user_id, period_type, period_start)
+    do update set
+      total_workouts = excluded.total_workouts,
+      total_volume_kg = excluded.total_volume_kg,
+      total_sets = excluded.total_sets,
+      total_duration_seconds = excluded.total_duration_seconds,
+      muscle_group_distribution = excluded.muscle_group_distribution,
+      computed_at = now();
+  end loop;
+end;
+$$;
+
+-- ============================================================
+-- dashboard_summary — recomputes streaks and this-week count.
+-- SECURITY DEFINER: dashboard_cache is read-only to users.
+-- ============================================================
+create or replace function public.dashboard_summary(p_user_id uuid)
+returns void
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  v_workout_dates date[];
+  v_current_streak integer := 0;
+  v_longest_streak integer := 0;
+  v_running integer := 0;
+  v_prev date;
+  v_d date;
+  v_this_week integer;
+  v_last_workout timestamptz;
+begin
+  select array_agg(distinct started_at::date order by started_at::date desc)
+  into v_workout_dates
+  from public.workout_sessions
+  where user_id = p_user_id and status = 'completed';
+
+  if v_workout_dates is not null then
+    v_prev := null;
+    foreach v_d in array v_workout_dates loop
+      if v_prev is null or v_prev - v_d = 1 then
+        v_running := v_running + 1;
+      else
+        v_running := 1;
+      end if;
+      v_longest_streak := greatest(v_longest_streak, v_running);
+      v_prev := v_d;
+    end loop;
+
+    -- Current streak only counts if it includes today or yesterday —
+    -- otherwise the streak has already been broken.
+    if v_workout_dates[1] >= current_date - 1 then
+      v_current_streak := 1;
+      for i in 2..array_length(v_workout_dates, 1) loop
+        if v_workout_dates[i-1] - v_workout_dates[i] = 1 then
+          v_current_streak := v_current_streak + 1;
+        else
+          exit;
+        end if;
+      end loop;
+    end if;
+  end if;
+
+  select count(*), max(started_at)
+  into v_this_week, v_last_workout
+  from public.workout_sessions
+  where user_id = p_user_id
+    and status = 'completed'
+    and started_at >= date_trunc('week', now());
+
+  insert into public.dashboard_cache (user_id, current_streak_days, longest_streak_days, workouts_this_week, last_workout_at, computed_at)
+  values (p_user_id, v_current_streak, v_longest_streak, coalesce(v_this_week, 0), v_last_workout, now())
+  on conflict (user_id)
+  do update set
+    current_streak_days = excluded.current_streak_days,
+    longest_streak_days = greatest(public.dashboard_cache.longest_streak_days, excluded.longest_streak_days),
+    workouts_this_week = excluded.workouts_this_week,
+    last_workout_at = excluded.last_workout_at,
+    computed_at = now();
+end;
+$$;
+
+-- ============================================================
+-- exercise_search — full text + trigram ranked search. SECURITY
+-- INVOKER (default) — respects the caller's own RLS, same as
+-- querying public.exercises directly.
+-- ============================================================
+create or replace function public.exercise_search(p_query text, p_limit integer default 30, p_offset integer default 0)
+returns setof public.exercises
+language sql
+stable
+as $$
+  select e.*
+  from public.exercises e
+  where p_query is null or p_query = ''
+     or e.search_vector @@ plainto_tsquery('english', unaccent(p_query))
+     or e.name % unaccent(p_query)
+  order by
+    case when p_query is null or p_query = '' then 0
+    else ts_rank(e.search_vector, plainto_tsquery('english', unaccent(p_query))) end desc,
+    similarity(e.name, coalesce(p_query, '')) desc,
+    e.popularity desc,
+    e.name asc
+  limit p_limit offset p_offset;
+$$;
+
+-- ============================================================
+-- recent_workouts — SECURITY INVOKER, thin RPC convenience
+-- wrapper over history_view for the Dashboard's recent list.
+-- ============================================================
+create or replace function public.recent_workouts(p_user_id uuid, p_limit integer default 10)
+returns setof public.history_view
+language sql
+stable
+as $$
+  select * from public.history_view
+  where user_id = p_user_id
+  order by started_at desc
+  limit p_limit;
+$$;
+
+-- ============================================================
+-- favorite_toggle — SECURITY INVOKER; the underlying insert/
+-- delete is governed by the normal favorites RLS policies, so
+-- this cannot be used to favorite on another user's behalf.
+-- Returns true if now favorited, false if removed.
+-- ============================================================
+create or replace function public.favorite_toggle(p_user_id uuid, p_exercise_id uuid)
+returns boolean
+language plpgsql
+as $$
+declare
+  v_existing uuid;
+begin
+  select id into v_existing
+  from public.favorites
+  where user_id = p_user_id and exercise_id = p_exercise_id;
+
+  if v_existing is not null then
+    delete from public.favorites where id = v_existing;
+    return false;
+  else
+    insert into public.favorites (user_id, exercise_id) values (p_user_id, p_exercise_id);
+    return true;
+  end if;
+end;
+$$;
+
+-- ============================================================
+-- session_summary — single-row RPC convenience wrapper over
+-- history_view, for a "workout finished" summary screen.
+-- ============================================================
+create or replace function public.session_summary(p_session_id uuid)
+returns public.history_view
+language sql
+stable
+as $$
+  select * from public.history_view where session_id = p_session_id;
+$$;
+
+-- ============================================================
+-- history_summary — paginated wrapper over history_view.
+-- ============================================================
+create or replace function public.history_summary(p_user_id uuid, p_limit integer default 20, p_offset integer default 0)
+returns setof public.history_view
+language sql
+stable
+as $$
+  select * from public.history_view
+  where user_id = p_user_id
+  order by started_at desc
+  limit p_limit offset p_offset;
+$$;
+
+
+-- ==========================================
+-- MIGRATION: 000010_triggers.sql
+-- ==========================================
+-- ============================================================
+-- Generic updated_at maintenance
+-- ============================================================
+create or replace function public.set_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+create trigger set_profiles_updated_at before update on public.profiles
+  for each row execute function public.set_updated_at();
+create trigger set_user_preferences_updated_at before update on public.user_preferences
+  for each row execute function public.set_updated_at();
+create trigger set_exercises_updated_at before update on public.exercises
+  for each row execute function public.set_updated_at();
+create trigger set_workout_templates_updated_at before update on public.workout_templates
+  for each row execute function public.set_updated_at();
+
+-- ============================================================
+-- Exercise search_vector maintenance (base fields)
+-- ============================================================
+create or replace function public.handle_exercise_search_base()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.search_vector := to_tsvector('english',
+    unaccent(coalesce(new.name, '')) || ' ' ||
+    unaccent(coalesce(new.description, '')) || ' ' ||
+    unaccent(array_to_string(coalesce(new.instructions, '{}'), ' '))
+  );
+  return new;
+end;
+$$;
+
+create trigger exercise_search_base_trigger
+  before insert or update of name, description, instructions on public.exercises
+  for each row execute function public.handle_exercise_search_base();
+
+-- Incrementally folds a muscle/equipment name into an exercise's
+-- existing search_vector rather than recomputing from scratch — cheap,
+-- and correct because tsvector concatenation (||) is idempotent-safe
+-- for our purposes (duplicate lexemes just don't add new matches).
+create or replace function public.handle_exercise_search_append()
+returns trigger
+language plpgsql
+as $$
+declare
+  v_exercise_id uuid;
+  v_term text;
+begin
+  v_exercise_id := coalesce(new.exercise_id, old.exercise_id);
+
+  if TG_TABLE_NAME = 'exercise_muscles' then
+    select name into v_term from public.muscle_groups where id = coalesce(new.muscle_group_id, old.muscle_group_id);
+  else
+    select name into v_term from public.equipment where id = coalesce(new.equipment_id, old.equipment_id);
+  end if;
+
+  update public.exercises
+  set search_vector = search_vector || to_tsvector('english', unaccent(coalesce(v_term, '')))
+  where id = v_exercise_id;
+
+  return coalesce(new, old);
+end;
+$$;
+
+create trigger exercise_muscles_search_trigger
+  after insert on public.exercise_muscles
+  for each row execute function public.handle_exercise_search_append();
+
+create trigger exercise_equipment_search_trigger
+  after insert on public.exercise_equipment
+  for each row execute function public.handle_exercise_search_append();
+
+-- ============================================================
+-- body_region denormalization: kept in sync with the exercise's
+-- primary muscle. See 000004_exercises.sql's comment on why this
+-- is denormalized at all.
+-- ============================================================
+create or replace function public.sync_exercise_body_region()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.role = 'primary' then
+    update public.exercises
+    set body_region = (select body_region from public.muscle_groups where id = new.muscle_group_id)
+    where id = new.exercise_id;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger sync_exercise_body_region_trigger
+  after insert on public.exercise_muscles
+  for each row execute function public.sync_exercise_body_region();
+
+-- exercise_type denormalization: kept in sync if category_id changes
+-- after initial insert (the importer sets exercise_type directly at
+-- insert time — this trigger only handles the edit-after-the-fact case).
+create or replace function public.sync_exercise_type_from_category()
+returns trigger
+language plpgsql
+as $$
+declare
+  v_category_name text;
+begin
+  if new.category_id is distinct from old.category_id then
+    select name into v_category_name from public.exercise_categories where id = new.category_id;
+    new.exercise_type := case
+      when v_category_name in ('strength', 'powerlifting', 'olympic_weightlifting', 'strongman', 'plyometrics') then 'strength'
+      when v_category_name = 'cardio' then 'cardio'
+      when v_category_name = 'stretching' then 'mobility'
+      else new.exercise_type
+    end;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger sync_exercise_type_trigger
+  before update of category_id on public.exercises
+  for each row execute function public.sync_exercise_type_from_category();
+
+-- ============================================================
+-- workout_sessions: auto-complete duration, touch last_activity_at
+-- ============================================================
+create or replace function public.handle_workout_session_completion()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.status = 'completed' and old.status <> 'completed' then
+    if new.completed_at is null then
+      new.completed_at := now();
+    end if;
+    new.duration_seconds := extract(epoch from (new.completed_at - new.started_at))::integer;
+  end if;
+  new.last_activity_at := now();
+  return new;
+end;
+$$;
+
+create trigger workout_session_completion_trigger
+  before update on public.workout_sessions
+  for each row execute function public.handle_workout_session_completion();
+
+-- After a session completes, refresh the cache tables that summarize
+-- completed workouts. Runs AFTER so it sees the committed row.
+create or replace function public.handle_workout_session_completed_after()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.status = 'completed' and old.status <> 'completed' then
+    perform public.update_statistics(new.user_id);
+    perform public.dashboard_summary(new.user_id);
+  end if;
+  return new;
+end;
+$$;
+
+create trigger workout_session_completed_after_trigger
+  after update on public.workout_sessions
+  for each row execute function public.handle_workout_session_completed_after();
+
+-- ============================================================
+-- workout_session_exercises: touch the parent session's
+-- last_activity_at whenever exercises are added/removed/skipped
+-- mid-workout.
+-- ============================================================
+create or replace function public.touch_session_activity()
+returns trigger
+language plpgsql
+as $$
+begin
+  update public.workout_sessions
+  set last_activity_at = now()
+  where id = coalesce(new.workout_session_id, old.workout_session_id);
+  return coalesce(new, old);
+end;
+$$;
+
+create trigger session_exercises_touch_activity_trigger
+  after insert or update or delete on public.workout_session_exercises
+  for each row execute function public.touch_session_activity();
+
+-- ============================================================
+-- workout_sets: the highest-value trigger in this schema — every
+-- set logged updates session volume/activity, checks for a new PR,
+-- and rolls up exercise history. PRs and exercise_history are
+-- intentionally NOT retroactively revoked on UPDATE/DELETE of a
+-- set — matches user expectation that an achieved PR stays
+-- achieved (same behavior as Strong/Hevy), not an oversight.
+-- ============================================================
+create or replace function public.handle_workout_set_change()
+returns trigger
+language plpgsql
+as $$
+declare
+  v_session_id uuid;
+begin
+  select wse.workout_session_id into v_session_id
+  from public.workout_session_exercises wse
+  where wse.id = coalesce(new.workout_session_exercise_id, old.workout_session_exercise_id);
+
+  update public.workout_sessions
+  set total_volume_kg = public.calculate_workout_volume(v_session_id),
+      last_activity_at = now()
+  where id = v_session_id;
+
+  if TG_OP in ('INSERT', 'UPDATE') and new.is_warmup = false then
+    perform public.update_personal_record(new.id);
+    perform public.update_exercise_history(new.id);
+  end if;
+
+  return coalesce(new, old);
+end;
+$$;
+
+create trigger workout_set_change_trigger
+  after insert or update or delete on public.workout_sets
+  for each row execute function public.handle_workout_set_change();
+
+
+-- ==========================================
+-- MIGRATION: 000011_policies.sql
+-- ==========================================
+-- ============================================================
+-- Profiles & personal data — owner-only, full CRUD on own rows.
+-- Every UPDATE policy has WITH CHECK, not just USING: USING alone
+-- only gates which existing rows can be targeted, not what the row
+-- is allowed to become — without WITH CHECK a user could rewrite
+-- their own row's id/user_id to point at someone else. See the
+-- original Sprint 1 security hardening notes for the full incident
+-- this pattern was learned from.
+-- ============================================================
+
+alter table public.profiles enable row level security;
+create policy "profiles_select_own" on public.profiles for select using (auth.uid() = id);
+create policy "profiles_update_own" on public.profiles for update using (auth.uid() = id) with check (auth.uid() = id);
+create policy "profiles_insert_own" on public.profiles for insert with check (auth.uid() = id);
+
+alter table public.user_preferences enable row level security;
+create policy "user_preferences_select_own" on public.user_preferences for select using (auth.uid() = user_id);
+create policy "user_preferences_update_own" on public.user_preferences for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "user_preferences_insert_own" on public.user_preferences for insert with check (auth.uid() = user_id);
+
+alter table public.body_measurements enable row level security;
+create policy "body_measurements_select_own" on public.body_measurements for select using (auth.uid() = user_id);
+create policy "body_measurements_insert_own" on public.body_measurements for insert with check (auth.uid() = user_id);
+create policy "body_measurements_update_own" on public.body_measurements for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "body_measurements_delete_own" on public.body_measurements for delete using (auth.uid() = user_id);
+
+alter table public.weight_history enable row level security;
+create policy "weight_history_select_own" on public.weight_history for select using (auth.uid() = user_id);
+create policy "weight_history_insert_own" on public.weight_history for insert with check (auth.uid() = user_id);
+create policy "weight_history_update_own" on public.weight_history for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "weight_history_delete_own" on public.weight_history for delete using (auth.uid() = user_id);
+
+-- ============================================================
+-- Reference/taxonomy tables — shared read-only data. Any
+-- authenticated user (including guests — Supabase anonymous
+-- sessions carry the `authenticated` Postgres role) can read;
+-- only service_role can write, matching the exercise library's
+-- own write policy below.
+-- ============================================================
+
+alter table public.muscle_groups enable row level security;
+create policy "muscle_groups_select_all" on public.muscle_groups for select using (auth.role() = 'authenticated');
+create policy "muscle_groups_service_write" on public.muscle_groups for insert with check (auth.role() = 'service_role');
+
+alter table public.equipment enable row level security;
+create policy "equipment_select_all" on public.equipment for select using (auth.role() = 'authenticated');
+create policy "equipment_service_write" on public.equipment for insert with check (auth.role() = 'service_role');
+
+alter table public.exercise_categories enable row level security;
+create policy "exercise_categories_select_all" on public.exercise_categories for select using (auth.role() = 'authenticated');
+create policy "exercise_categories_service_write" on public.exercise_categories for insert with check (auth.role() = 'service_role');
+
+alter table public.exercise_tags enable row level security;
+create policy "exercise_tags_select_all" on public.exercise_tags for select using (auth.role() = 'authenticated');
+create policy "exercise_tags_service_write" on public.exercise_tags for insert with check (auth.role() = 'service_role');
+
+-- ============================================================
+-- Exercise library — shared read-only reference data. Same
+-- pattern as the original MVP exercises table: readable by any
+-- authenticated user, writable only by service_role (no
+-- user-created exercises yet — is_custom/created_by are schema-
+-- ready for when that feature is built, at which point these
+-- policies need a second INSERT/UPDATE branch for
+-- `created_by = auth.uid()`, not a redesign).
+-- ============================================================
+
+alter table public.exercises enable row level security;
+create policy "exercises_select_all" on public.exercises for select using (auth.role() = 'authenticated');
+create policy "exercises_service_write" on public.exercises for insert with check (auth.role() = 'service_role');
+create policy "exercises_service_update" on public.exercises for update using (auth.role() = 'service_role') with check (auth.role() = 'service_role');
+
+alter table public.exercise_aliases enable row level security;
+create policy "exercise_aliases_select_all" on public.exercise_aliases for select using (auth.role() = 'authenticated');
+create policy "exercise_aliases_service_write" on public.exercise_aliases for insert with check (auth.role() = 'service_role');
+
+alter table public.exercise_images enable row level security;
+create policy "exercise_images_select_all" on public.exercise_images for select using (auth.role() = 'authenticated');
+create policy "exercise_images_service_write" on public.exercise_images for insert with check (auth.role() = 'service_role');
+
+alter table public.exercise_videos enable row level security;
+create policy "exercise_videos_select_all" on public.exercise_videos for select using (auth.role() = 'authenticated');
+create policy "exercise_videos_service_write" on public.exercise_videos for insert with check (auth.role() = 'service_role');
+
+alter table public.exercise_muscles enable row level security;
+create policy "exercise_muscles_select_all" on public.exercise_muscles for select using (auth.role() = 'authenticated');
+create policy "exercise_muscles_service_write" on public.exercise_muscles for insert with check (auth.role() = 'service_role');
+
+alter table public.exercise_equipment enable row level security;
+create policy "exercise_equipment_select_all" on public.exercise_equipment for select using (auth.role() = 'authenticated');
+create policy "exercise_equipment_service_write" on public.exercise_equipment for insert with check (auth.role() = 'service_role');
+
+alter table public.exercise_tag_map enable row level security;
+create policy "exercise_tag_map_select_all" on public.exercise_tag_map for select using (auth.role() = 'authenticated');
+create policy "exercise_tag_map_service_write" on public.exercise_tag_map for insert with check (auth.role() = 'service_role');
+
+alter table public.exercise_progressions enable row level security;
+create policy "exercise_progressions_select_all" on public.exercise_progressions for select using (auth.role() = 'authenticated');
+create policy "exercise_progressions_service_write" on public.exercise_progressions for insert with check (auth.role() = 'service_role');
+
+alter table public.exercise_regressions enable row level security;
+create policy "exercise_regressions_select_all" on public.exercise_regressions for select using (auth.role() = 'authenticated');
+create policy "exercise_regressions_service_write" on public.exercise_regressions for insert with check (auth.role() = 'service_role');
+
+alter table public.exercise_alternatives enable row level security;
+create policy "exercise_alternatives_select_all" on public.exercise_alternatives for select using (auth.role() = 'authenticated');
+create policy "exercise_alternatives_service_write" on public.exercise_alternatives for insert with check (auth.role() = 'service_role');
+
+-- ============================================================
+-- Workout tracking — strictly owner-only.
+-- ============================================================
+
+alter table public.workout_sessions enable row level security;
+create policy "workout_sessions_select_own" on public.workout_sessions for select using (auth.uid() = user_id);
+create policy "workout_sessions_insert_own" on public.workout_sessions for insert with check (auth.uid() = user_id);
+create policy "workout_sessions_update_own" on public.workout_sessions for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "workout_sessions_delete_own" on public.workout_sessions for delete using (auth.uid() = user_id);
+
+alter table public.workout_session_exercises enable row level security;
+create policy "session_exercises_select_own" on public.workout_session_exercises for select
+  using (exists (select 1 from public.workout_sessions s where s.id = workout_session_id and s.user_id = auth.uid()));
+create policy "session_exercises_all_own" on public.workout_session_exercises for all
+  using (exists (select 1 from public.workout_sessions s where s.id = workout_session_id and s.user_id = auth.uid()))
+  with check (exists (select 1 from public.workout_sessions s where s.id = workout_session_id and s.user_id = auth.uid()));
+
+alter table public.workout_sets enable row level security;
+create policy "workout_sets_select_own" on public.workout_sets for select
+  using (exists (
+    select 1 from public.workout_session_exercises se
+    join public.workout_sessions s on s.id = se.workout_session_id
+    where se.id = workout_session_exercise_id and s.user_id = auth.uid()
+  ));
+create policy "workout_sets_all_own" on public.workout_sets for all
+  using (exists (
+    select 1 from public.workout_session_exercises se
+    join public.workout_sessions s on s.id = se.workout_session_id
+    where se.id = workout_session_exercise_id and s.user_id = auth.uid()
+  ))
+  with check (exists (
+    select 1 from public.workout_session_exercises se
+    join public.workout_sessions s on s.id = se.workout_session_id
+    where se.id = workout_session_exercise_id and s.user_id = auth.uid()
+  ));
+
+-- ============================================================
+-- Templates — system templates (user_id null) visible to all;
+-- user-owned templates visible/editable by their owner only.
+-- ============================================================
+
+alter table public.workout_templates enable row level security;
+create policy "workout_templates_select" on public.workout_templates for select
+  using (user_id is null or user_id = auth.uid() or is_public = true);
+create policy "workout_templates_insert_own" on public.workout_templates for insert with check (auth.uid() = user_id);
+create policy "workout_templates_update_own" on public.workout_templates for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "workout_templates_delete_own" on public.workout_templates for delete using (auth.uid() = user_id);
+
+alter table public.template_exercises enable row level security;
+create policy "template_exercises_select" on public.template_exercises for select
+  using (exists (
+    select 1 from public.workout_templates t
+    where t.id = workout_template_id and (t.user_id is null or t.user_id = auth.uid() or t.is_public = true)
+  ));
+create policy "template_exercises_all_own" on public.template_exercises for all
+  using (exists (select 1 from public.workout_templates t where t.id = workout_template_id and t.user_id = auth.uid()))
+  with check (exists (select 1 from public.workout_templates t where t.id = workout_template_id and t.user_id = auth.uid()));
+
+-- ============================================================
+-- Favorites — strictly owner-only.
+-- ============================================================
+
+alter table public.favorites enable row level security;
+create policy "favorites_select_own" on public.favorites for select using (auth.uid() = user_id);
+create policy "favorites_insert_own" on public.favorites for insert with check (auth.uid() = user_id);
+create policy "favorites_delete_own" on public.favorites for delete using (auth.uid() = user_id);
+
+-- ============================================================
+-- Cache tables — read-only to users. All writes happen through
+-- SECURITY DEFINER functions (update_personal_record,
+-- update_exercise_history, update_statistics, dashboard_summary)
+-- called by triggers, never by direct user INSERT/UPDATE. This is
+-- the enforcement mechanism for "these are caches, not
+-- user-editable data" — there is deliberately no INSERT/UPDATE
+-- policy for the authenticated role on any of these four tables.
+-- ============================================================
+
+alter table public.personal_records enable row level security;
+create policy "personal_records_select_own" on public.personal_records for select using (auth.uid() = user_id);
+
+alter table public.exercise_history enable row level security;
+create policy "exercise_history_select_own" on public.exercise_history for select using (auth.uid() = user_id);
+
+alter table public.statistics_cache enable row level security;
+create policy "statistics_cache_select_own" on public.statistics_cache for select using (auth.uid() = user_id);
+
+alter table public.dashboard_cache enable row level security;
+create policy "dashboard_cache_select_own" on public.dashboard_cache for select using (auth.uid() = user_id);
+
+
+-- ==========================================
+-- MIGRATION: 000012_sync_and_settings.sql
+-- ==========================================
+-- Offline sync queue — supports the local-first workout session flow
+-- described in the original docs/SYNC.md (mobile queues writes locally,
+-- pushes when connectivity returns). This table is the server-side
+-- record of what was synced and when, useful for conflict debugging and
+-- multi-device awareness; the mobile client's local queue itself lives
+-- on-device, not here.
+create table public.sync_queue (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  entity_type text not null check (entity_type in ('workout_session', 'workout_session_exercise', 'workout_set', 'weight_history', 'body_measurement')),
+  entity_id uuid not null,
+  operation text not null check (operation in ('insert', 'update', 'delete')),
+  payload jsonb,
+  status text not null default 'pending' check (status in ('pending', 'synced', 'failed')),
+  error_message text,
+  created_at timestamptz not null default now(),
+  synced_at timestamptz
+);
+
+create index sync_queue_user_status_idx on public.sync_queue (user_id, status);
+
+alter table public.sync_queue enable row level security;
+create policy "sync_queue_select_own" on public.sync_queue for select using (auth.uid() = user_id);
+create policy "sync_queue_insert_own" on public.sync_queue for insert with check (auth.uid() = user_id);
+create policy "sync_queue_update_own" on public.sync_queue for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+create policy "sync_queue_delete_own" on public.sync_queue for delete using (auth.uid() = user_id);
+
+-- Global app configuration — feature flags, minimum supported app
+-- version, maintenance-mode flags. Not user data; a single shared table
+-- the whole app reads on startup.
+create table public.app_settings (
+  key text primary key,
+  value jsonb not null,
+  description text,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.app_settings enable row level security;
+create policy "app_settings_select_all" on public.app_settings for select using (auth.role() = 'authenticated');
+create policy "app_settings_service_write" on public.app_settings for all
+  using (auth.role() = 'service_role') with check (auth.role() = 'service_role');
+
+
+-- ==========================================
+-- MIGRATION: 000013_grants.sql
+-- ==========================================
+-- RLS policies (000011) restrict WHICH rows a role can touch — but
+-- Postgres separately requires table-level GRANTs before RLS is even
+-- evaluated. Supabase's platform pre-configures default privileges so
+-- new tables automatically grant to anon/authenticated/service_role,
+-- which is why this migration is easy to forget is even necessary — but
+-- a "ready to apply with minimal manual work" deliverable shouldn't
+-- depend on an implicit, undocumented-in-this-repo platform behavior.
+-- Explicit grants here mean this schema is correct even if applied
+-- somewhere that behaves differently (e.g. a self-hosted Supabase
+-- instance with different default privilege configuration).
+
+grant usage on schema public to authenticated, anon, service_role;
+
+grant select, insert, update, delete on all tables in schema public to authenticated;
+grant select on all tables in schema public to anon;
+grant all on all tables in schema public to service_role;
+
+grant usage, select on all sequences in schema public to authenticated, service_role;
+
+grant execute on all functions in schema public to authenticated, service_role;
+
+-- Ensures tables created by FUTURE migrations also get these grants
+-- automatically, without needing another grants migration each time.
+alter default privileges in schema public
+  grant select, insert, update, delete on tables to authenticated;
+alter default privileges in schema public
+  grant select on tables to anon;
+alter default privileges in schema public
+  grant all on tables to service_role;
+alter default privileges in schema public
+  grant execute on functions to authenticated, service_role;
+
+
+-- ==========================================
+-- SEED DATA: 02_exercise_library.sql
+-- ==========================================
+-- Generated by exercise_import/importer/generate_sql.py — do not hand-edit.
+-- Regenerate by re-running the transform -> validate -> generate_sql pipeline.
+-- Source: free-exercise-db (public domain), github.com/yuhonas/free-exercise-db
+
+-- ============ Reference data ============
+
+insert into public.exercise_categories (name, description, display_order) values ('strength', 'Traditional resistance training exercises', 0) on conflict (name) do nothing;
+insert into public.exercise_categories (name, description, display_order) values ('cardio', 'Cardiovascular/endurance exercises', 1) on conflict (name) do nothing;
+insert into public.exercise_categories (name, description, display_order) values ('stretching', 'Flexibility and mobility exercises', 2) on conflict (name) do nothing;
+insert into public.exercise_categories (name, description, display_order) values ('plyometrics', 'Explosive, jump-based training', 3) on conflict (name) do nothing;
+insert into public.exercise_categories (name, description, display_order) values ('powerlifting', 'Squat, bench, deadlift and their variations', 4) on conflict (name) do nothing;
+insert into public.exercise_categories (name, description, display_order) values ('olympic weightlifting', 'Snatch, clean & jerk and their variations', 5) on conflict (name) do nothing;
+insert into public.exercise_categories (name, description, display_order) values ('strongman', 'Strongman-style functional strength movements', 6) on conflict (name) do nothing;
+
+insert into public.muscle_groups (name, body_region, display_order) values ('quadriceps', 'lower_body', 0) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('hamstrings', 'lower_body', 1) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('calves', 'lower_body', 2) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('glutes', 'lower_body', 3) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('adductors', 'lower_body', 4) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('abductors', 'lower_body', 5) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('shoulders', 'upper_body', 6) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('chest', 'upper_body', 7) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('triceps', 'upper_body', 8) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('biceps', 'upper_body', 9) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('lats', 'upper_body', 10) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('middle back', 'upper_body', 11) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('forearms', 'upper_body', 12) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('traps', 'upper_body', 13) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('neck', 'upper_body', 14) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('abdominals', 'core', 15) on conflict (name) do nothing;
+insert into public.muscle_groups (name, body_region, display_order) values ('lower back', 'core', 16) on conflict (name) do nothing;
+
+insert into public.equipment (name, equipment_category, display_order) values ('Barbell', 'free_weight', 0) on conflict (name) do nothing;
+insert into public.equipment (name, equipment_category, display_order) values ('Bodyweight', 'bodyweight', 1) on conflict (name) do nothing;
+insert into public.equipment (name, equipment_category, display_order) values ('Cable', 'cable', 2) on conflict (name) do nothing;
+insert into public.equipment (name, equipment_category, display_order) values ('Dumbbell', 'free_weight', 3) on conflict (name) do nothing;
+insert into public.equipment (name, equipment_category, display_order) values ('EZ Curl Bar', 'free_weight', 4) on conflict (name) do nothing;
+insert into public.equipment (name, equipment_category, display_order) values ('Exercise Ball', 'accessory', 5) on conflict (name) do nothing;
+insert into public.equipment (name, equipment_category, display_order) values ('Foam Roller', 'accessory', 6) on conflict (name) do nothing;
+insert into public.equipment (name, equipment_category, display_order) values ('Kettlebell', 'free_weight', 7) on conflict (name) do nothing;
+insert into public.equipment (name, equipment_category, display_order) values ('Machine', 'machine', 8) on conflict (name) do nothing;
+insert into public.equipment (name, equipment_category, display_order) values ('Medicine Ball', 'accessory', 9) on conflict (name) do nothing;
+insert into public.equipment (name, equipment_category, display_order) values ('Other', 'accessory', 10) on conflict (name) do nothing;
+insert into public.equipment (name, equipment_category, display_order) values ('Resistance Band', 'accessory', 11) on conflict (name) do nothing;
+
+-- ============ Exercises ============
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('3/4 Sit-Up', '3-4-sit-up', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Lie down on the floor and secure your feet. Your legs should be bent at the knees.', 'Place your hands behind or to the side of your head. You will begin with your back on the ground. This will be your starting position.', 'Flex your hips and spine to raise your torso toward your knees.', 'At the top of the contraction your torso should be perpendicular to the ground. Reverse the motion, going only ¾ of the way down.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = '3-4-sit-up';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/3_4_Sit-Up/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/3_4_Sit-Up/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Ab Crunch Machine', 'ab-crunch-machine', NULL, v_category_id, 'strength', 'isolation', 'pull', 'intermediate', ARRAY['Select a light resistance and sit down on the ab machine placing your feet under the pads provided and grabbing the top handles. Your arms should be bent at a 90 degree angle as you rest the triceps on the pads provided. This will be your starting position.', 'At the same time, begin to lift the legs up as you crunch your upper torso. Breathe out as you perform this movement. Tip: Be sure to use a slow and controlled motion. Concentrate on using your abs to move the weight while relaxing your legs and feet.', 'After a second pause, slowly return to the starting position as you breathe in.', 'Repeat the movement for the prescribed amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'ab-crunch-machine';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Machine' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Ab_Crunch_Machine/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Ab_Crunch_Machine/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Ab Roller', 'ab-roller', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Hold the Ab Roller with both hands and kneel on the floor.', 'Now place the ab roller on the floor in front of you so that you are on all your hands and knees (as in a kneeling push up position). This will be your starting position.', 'Slowly roll the ab roller straight forward, stretching your body into a straight position. Tip: Go down as far as you can without touching the floor with your body. Breathe in during this portion of the movement.', 'After a pause at the stretched position, start pulling yourself back to the starting position as you breathe out. Tip: Go slowly and keep your abs tight at all times.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'ab-roller';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Ab_Roller/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Ab_Roller/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Advanced Kettlebell Windmill', 'advanced-kettlebell-windmill', NULL, v_category_id, 'strength', 'isolation', 'push', 'intermediate', ARRAY['Clean and press a kettlebell overhead with one arm.', 'Keeping the kettlebell locked out at all times, push your butt out in the direction of the locked out kettlebell. Keep the non-working arm behind your back and turn your feet out at a forty-five degree angle from the arm with the kettlebell.', 'Lower yourself as far as possible.', 'Pause for a second and reverse the motion back to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'advanced-kettlebell-windmill';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Advanced_Kettlebell_Windmill/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Advanced_Kettlebell_Windmill/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Air Bike', 'air-bike', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Lie flat on the floor with your lower back pressed to the ground. For this exercise, you will need to put your hands beside your head. Be careful however to not strain with the neck as you perform it. Now lift your shoulders into the crunch position.', 'Bring knees up to where they are perpendicular to the floor, with your lower legs parallel to the floor. This will be your starting position.', 'Now simultaneously, slowly go through a cycle pedal motion kicking forward with the right leg and bringing in the knee of the left leg. Bring your right elbow close to your left knee by crunching to the side, as you breathe out.', 'Go back to the initial position as you breathe in.', 'Crunch to the opposite side as you cycle your legs and bring closer your left elbow to your right knee and exhale.', 'Continue alternating in this manner until all of the recommended repetitions for each side have been completed.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'air-bike';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Air_Bike/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Air_Bike/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Alternate Hammer Curl', 'alternate-hammer-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up with your torso upright and a dumbbell in each hand being held at arms length. The elbows should be close to the torso.', 'The palms of the hands should be facing your torso. This will be your starting position.', 'While holding the upper arm stationary, curl the right weight forward while contracting the biceps as you breathe out. Continue the movement until your biceps is fully contracted and the dumbbells are at shoulder level. Hold the contracted position for a second as you squeeze the biceps. Tip: Only the forearms should move.', 'Slowly begin to bring the dumbbells back to starting position as your breathe in.', 'Repeat the movement with the left hand. This equals one repetition.', 'Continue alternating in this manner for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'alternate-hammer-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternate_Hammer_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternate_Hammer_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Alternate Heel Touchers', 'alternate-heel-touchers', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Lie on the floor with the knees bent and the feet on the floor around 18-24 inches apart. Your arms should be extended by your side. This will be your starting position.', 'Crunch over your torso forward and up about 3-4 inches to the right side and touch your right heel as you hold the contraction for a second. Exhale while performing this movement.', 'Now go back slowly to the starting position as you inhale.', 'Now crunch over your torso forward and up around 3-4 inches to the left side and touch your left heel as you hold the contraction for a second. Exhale while performing this movement and then go back to the starting position as you inhale. Now that both heels have been touched, that is considered 1 repetition.', 'Continue alternating sides in this manner until all prescribed repetitions are done.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'alternate-heel-touchers';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternate_Heel_Touchers/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternate_Heel_Touchers/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Alternate Incline Dumbbell Curl', 'alternate-incline-dumbbell-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Sit down on an incline bench with a dumbbell in each hand being held at arms length. Tip: Keep the elbows close to the torso.This will be your starting position.', 'While holding the upper arm stationary, curl the right weight forward while contracting the biceps as you breathe out. As you do so, rotate the hand so that the palm is facing up. Continue the movement until your biceps is fully contracted and the dumbbells are at shoulder level. Hold the contracted position for a second as you squeeze the biceps. Tip: Only the forearms should move.', 'Slowly begin to bring the dumbbell back to starting position as your breathe in.', 'Repeat the movement with the left hand. This equals one repetition.', 'Continue alternating in this manner for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'alternate-incline-dumbbell-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternate_Incline_Dumbbell_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternate_Incline_Dumbbell_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Alternating Cable Shoulder Press', 'alternating-cable-shoulder-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Move the cables to the bottom of the tower and select an appropriate weight.', 'Grasp the cables and hold them at shoulder height, palms facing forward. This will be your starting position.', 'Keeping your head and chest up, extend through the elbow to press one side directly over head.', 'After pausing at the top, return to the starting position and repeat on the opposite side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'alternating-cable-shoulder-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Cable_Shoulder_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Cable_Shoulder_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Alternating Deltoid Raise', 'alternating-deltoid-raise', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['In a standing position, hold a pair of dumbbells at your side.', 'Keeping your elbows slightly bent, raise the weights directly in front of you to shoulder height, avoiding any swinging or cheating.', 'Return the weights to your side.', 'On the next repetition, raise the weights laterally, raising them out to your side to about shoulder height.', 'Return the weights to the starting position and continue alternating to the front and side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'alternating-deltoid-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Deltoid_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Deltoid_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Alternating Floor Press', 'alternating-floor-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Lie on the floor with two kettlebells next to your shoulders.', 'Position one in place on your chest and then the other, gripping the kettlebells on the handle with the palms facing forward.', 'Extend both arms, so that the kettlebells are being held above your chest. Lower one kettlebell, bringing it to your chest and turn the wrist in the direction of the locked out kettlebell.', 'Raise the kettlebell and repeat on the opposite side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'alternating-floor-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Floor_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Floor_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Alternating Hang Clean', 'alternating-hang-clean', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Place two kettlebells between your feet. To get in the starting position, push your butt back and look straight ahead.', 'Clean one kettlebell to your shoulder and hold on to the other kettlebell in a hanging position. Clean the kettlebell to your shoulder by extending through the legs and hips as you pull the kettlebell towards your shoulders. Rotate your wrist as you do so.', 'Lower the cleaned kettlebell to a hanging position and clean the alternate kettlebell. Repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'alternating-hang-clean';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Hang_Clean/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Hang_Clean/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Alternating Kettlebell Press', 'alternating-kettlebell-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Clean two kettlebells to your shoulders. Clean the kettlebells to your shoulders by extending through the legs and hips as you pull the kettlebells towards your shoulders. Rotate your wrists as you do so.', 'Press one directly overhead by extending through the elbow, turning it so the palm faces forward while holding the other kettlebell stationary .', 'Lower the pressed kettlebell to the starting position and immediately press with your other arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'alternating-kettlebell-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Kettlebell_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Kettlebell_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Alternating Kettlebell Row', 'alternating-kettlebell-row', NULL, v_category_id, 'strength', 'isolation', 'pull', 'intermediate', ARRAY['Place two kettlebells in front of your feet. Bend your knees slightly and push your butt out as much as possible. As you bend over to get into the starting position grab both kettlebells by the handles.', 'Pull one kettlebell off of the floor while holding on to the other kettlebell. Retract the shoulder blade of the working side, as you flex the elbow, drawing the kettlebell towards your stomach or rib cage.', 'Lower the kettlebell in the working arm and repeat with your other arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'alternating-kettlebell-row';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Kettlebell_Row/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Kettlebell_Row/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Alternating Renegade Row', 'alternating-renegade-row', NULL, v_category_id, 'strength', 'compound', 'pull', 'advanced', ARRAY['Place two kettlebells on the floor about shoulder width apart. Position yourself on your toes and your hands as though you were doing a pushup, with the body straight and extended. Use the handles of the kettlebells to support your upper body. You may need to position your feet wide for support.', 'Push one kettlebell into the floor and row the other kettlebell, retracting the shoulder blade of the working side as you flex the elbow, pulling it to your side.', 'Then lower the kettlebell to the floor and begin the kettlebell in the opposite hand. Repeat for several reps.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'alternating-renegade-row';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Renegade_Row/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternating_Renegade_Row/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Anti-Gravity Press', 'anti-gravity-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Place a bar on the ground behind the head of an incline bench.', 'Lay on the bench face down. With a pronated grip, pick the barbell up from the floor. Flex the elbows, performing a reverse curl to bring the bar near your chest. This will be your starting position.', 'To begin, press the barbell out in front of your head by extending your elbows. Keep your arms parallel to the ground throughout the movement.', 'Return to the starting position and repeat to complete the set.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'anti-gravity-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Anti-Gravity_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Anti-Gravity_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Arnold Dumbbell Press', 'arnold-dumbbell-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Sit on an exercise bench with back support and hold two dumbbells in front of you at about upper chest level with your palms facing your body and your elbows bent. Tip: Your arms should be next to your torso. The starting position should look like the contracted portion of a dumbbell curl.', 'Now to perform the movement, raise the dumbbells as you rotate the palms of your hands until they are facing forward.', 'Continue lifting the dumbbells until your arms are extended above you in straight arm position. Breathe out as you perform this portion of the movement.', 'After a second pause at the top, begin to lower the dumbbells to the original position by rotating the palms of your hands towards you. Tip: The left arm will be rotated in a counter clockwise manner while the right one will be rotated clockwise. Breathe in as you perform this portion of the movement.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'arnold-dumbbell-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Arnold_Dumbbell_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Arnold_Dumbbell_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Around The Worlds', 'around-the-worlds', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Lay down on a flat bench holding a dumbbell in each hand with the palms of the hands facing towards the ceiling. Tip: Your arms should be parallel to the floor and next to your thighs. To avoid injury, make sure that you keep your elbows slightly bent. This will be your starting position.', 'Now move the dumbbells by creating a semi-circle as you displace them from the initial position to over the head. All of the movement should happen with the arms parallel to the floor at all times. Breathe in as you perform this portion of the movement.', 'Reverse the movement to return the weight to the starting position as you exhale.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'around-the-worlds';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Around_The_Worlds/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Around_The_Worlds/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Back Flyes - With Bands', 'back-flyes-with-bands', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Run a band around a stationary post like that of a squat rack.', 'Grab the band by the handles and stand back so that the tension in the band rises.', 'Extend and lift the arms straight in front of you. Tip: Your arms should be straight and parallel to the floor while perpendicular to your torso. Your feet should be firmly planted on the floor spread at shoulder width. This will be your starting position.', 'As you exhale, move your arms to the sides and back. Keep your arms extended and parallel to the floor. Continue the movement until the arms are extended to your sides.', 'After a pause, go back to the original position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'back-flyes-with-bands';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Resistance Band' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Back_Flyes_-_With_Bands/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Back_Flyes_-_With_Bands/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Ball Leg Curl', 'ball-leg-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Begin on the floor laying on your back with your feet on top of the ball.', 'Position the ball so that when your legs are extended your ankles are on top of the ball. This will be your starting position.', 'Raise your hips off of the ground, keeping your weight on the shoulder blades and your feet.', 'Flex the knees, pulling the ball as close to you as you can, contracting the hamstrings.', 'After a brief pause, return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'ball-leg-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Exercise Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Ball_Leg_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Ball_Leg_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Band Hip Adductions', 'band-hip-adductions', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Anchor a band around a solid post or other object.', 'Stand with your left side to the post, and put your right foot through the band, getting it around the ankle.', 'Stand up straight and hold onto the post if needed. This will be your starting position.', 'Keeping the knee straight, raise your right legs out to the side as far as you can.', 'Return to the starting position and repeat for the desired rep count.', 'Switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'band-hip-adductions';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Resistance Band' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Band_Hip_Adductions/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Band_Hip_Adductions/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Band Pull Apart', 'band-pull-apart', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Begin with your arms extended straight out in front of you, holding the band with both hands.', 'Initiate the movement by performing a reverse fly motion, moving your hands out laterally to your sides.', 'Keep your elbows extended as you perform the movement, bringing the band to your chest. Ensure that you keep your shoulders back during the exercise.', 'Pause as you complete the movement, returning to the starting position under control.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'band-pull-apart';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Resistance Band' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Band_Pull_Apart/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Band_Pull_Apart/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Band Skull Crusher', 'band-skull-crusher', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Secure a band to the base of a rack or the bench. Lay on the bench so that the band is lined up with your head.', 'Take hold of the band, raising your elbows so that the upper arm is perpendicular to the floor. With the elbow flexed, the band should be above your head. This will be your starting position.', 'Extend through the elbow to straighten your arm, keeping your upper arm in place. Pause at the top of the motion, and return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'band-skull-crusher';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Resistance Band' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Band_Skull_Crusher/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Band_Skull_Crusher/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Ab Rollout', 'barbell-ab-rollout', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['For this exercise you will need to get into a pushup position, but instead of having your hands of the floor, you will be grabbing on to an Olympic barbell (loaded with 5-10 lbs on each side) instead. This will be your starting position.', 'While keeping a slight arch on your back, lift your hips and roll the barbell towards your feet as you exhale. Tip: As you perform the movement, your glutes should be coming up, you should be keeping the abs tight and should maintain your back posture at all times. Also your arms should be staying perpendicular to the floor throughout the movement. If you don''t, you will work out your shoulders and back more than the abs.', 'After a second contraction at the top, start to roll the barbell back forward to the starting position slowly as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-ab-rollout';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Ab_Rollout/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Ab_Rollout/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Ab Rollout - On Knees', 'barbell-ab-rollout-on-knees', NULL, v_category_id, 'strength', 'compound', 'pull', 'advanced', ARRAY['Hold an Olympic barbell loaded with 5-10lbs on each side and kneel on the floor.', 'Now place the barbell on the floor in front of you so that you are on all your hands and knees (as in a kneeling push up position). This will be your starting position.', 'Slowly roll the barbell straight forward, stretching your body into a straight position. Tip: Go down as far as you can without touching the floor with your body. Breathe in during this portion of the movement.', 'After a second pause at the stretched position, start pulling yourself back to the starting position as you breathe out. Tip: Go slowly and keep your abs tight at all times.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-ab-rollout-on-knees';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Ab_Rollout_-_On_Knees/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Ab_Rollout_-_On_Knees/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Bench Press - Medium Grip', 'barbell-bench-press-medium-grip', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Lie back on a flat bench. Using a medium width grip (a grip that creates a 90-degree angle in the middle of the movement between the forearms and the upper arms), lift the bar from the rack and hold it straight over you with your arms locked. This will be your starting position.', 'From the starting position, breathe in and begin coming down slowly until the bar touches your middle chest.', 'After a brief pause, push the bar back to the starting position as you breathe out. Focus on pushing the bar using your chest muscles. Lock your arms and squeeze your chest in the contracted position at the top of the motion, hold for a second and then start coming down slowly again. Tip: Ideally, lowering the weight should take about twice as long as raising it.', 'Repeat the movement for the prescribed amount of repetitions.', 'When you are done, place the bar back in the rack.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-bench-press-medium-grip';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Bench_Press_-_Medium_Grip/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Bench_Press_-_Medium_Grip/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Curl', 'barbell-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up with your torso upright while holding a barbell at a shoulder-width grip. The palm of your hands should be facing forward and the elbows should be close to the torso. This will be your starting position.', 'While holding the upper arms stationary, curl the weights forward while contracting the biceps as you breathe out. Tip: Only the forearms should move.', 'Continue the movement until your biceps are fully contracted and the bar is at shoulder level. Hold the contracted position for a second and squeeze the biceps hard.', 'Slowly begin to bring the bar back to starting position as your breathe in.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Curls Lying Against An Incline', 'barbell-curls-lying-against-an-incline', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Lie against an incline bench, with your arms holding a barbell and hanging down in a horizontal line. This will be your starting position.', 'While keeping the upper arms stationary, curl the weight up as high as you can while squeezing the biceps. Breathe out as you perform this portion of the movement. Tip: Only the forearms should move. Do not swing the arms.', 'After a second contraction, slowly go back to the starting position as you inhale. Tip: Make sure that you go all of the way down.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-curls-lying-against-an-incline';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Curls_Lying_Against_An_Incline/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Curls_Lying_Against_An_Incline/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Deadlift', 'barbell-deadlift', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Stand in front of a loaded barbell.', 'While keeping the back as straight as possible, bend your knees, bend forward and grasp the bar using a medium (shoulder width) overhand grip. This will be the starting position of the exercise. Tip: If it is difficult to hold on to the bar with this grip, alternate your grip or use wrist straps.', 'While holding the bar, start the lift by pushing with your legs while simultaneously getting your torso to the upright position as you breathe out. In the upright position, stick your chest out and contract the back by bringing the shoulder blades back. Think of how the soldiers in the military look when they are in standing in attention.', 'Go back to the starting position by bending at the knees while simultaneously leaning the torso forward at the waist while keeping the back straight. When the weights on the bar touch the floor you are back at the starting position and ready to perform another repetition.', 'Perform the amount of repetitions prescribed in the program.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-deadlift';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Deadlift/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Deadlift/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Full Squat', 'barbell-full-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['This exercise is best performed inside a squat rack for safety purposes. To begin, first set the bar on a rack just above shoulder level. Once the correct height is chosen and the bar is loaded, step under the bar and place the back of your shoulders (slightly below the neck) across it.', 'Hold on to the bar using both arms at each side and lift it off the rack by first pushing with your legs and at the same time straightening your torso.', 'Step away from the rack and position your legs using a shoulder-width medium stance with the toes slightly pointed out. Keep your head up at all times and maintain a straight back. This will be your starting position.', 'Begin to slowly lower the bar by bending the knees and sitting back with your hips as you maintain a straight posture with the head up. Continue down until your hamstrings are on your calves. Inhale as you perform this portion of the movement.', 'Begin to raise the bar as you exhale by pushing the floor with the heel or middle of your foot as you straighten the legs and extend the hips to go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-full-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Full_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Full_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Guillotine Bench Press', 'barbell-guillotine-bench-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Using a medium width grip (a grip that creates a 90-degree angle in the middle of the movement between the forearms and the upper arms), lift the bar from the rack and hold it straight over your neck with your arms locked. This will be your starting position.', 'As you breathe in, bring the bar down slowly until it is about 1 inch from your neck.', 'After a second pause, bring the bar back to the starting position as you breathe out and push the bar using your chest muscles. Lock your arms and squeeze your chest in the contracted position, hold for a second and then start coming down slowly again. It should take at least twice as long to go down than to come up.', 'Repeat the movement for the prescribed amount of repetitions.', 'When you are done, place the bar back in the rack.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-guillotine-bench-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Guillotine_Bench_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Guillotine_Bench_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Hack Squat', 'barbell-hack-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Stand up straight while holding a barbell behind you at arms length and your feet at shoulder width. Tip: A shoulder width grip is best with the palms of your hands facing back. You can use wrist wraps for this exercise for a better grip. This will be your starting position.', 'While keeping your head and eyes up and back straight, squat until your upper thighs are parallel to the floor. Breathe in as you slowly go down.', 'Pressing mainly with the heel of the foot and squeezing the thighs, go back up as you breathe out.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-hack-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Hack_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Hack_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Incline Bench Press - Medium Grip', 'barbell-incline-bench-press-medium-grip', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Lie back on an incline bench. Using a medium-width grip (a grip that creates a 90-degree angle in the middle of the movement between the forearms and the upper arms), lift the bar from the rack and hold it straight over you with your arms locked. This will be your starting position.', 'As you breathe in, come down slowly until you feel the bar on you upper chest.', 'After a second pause, bring the bar back to the starting position as you breathe out and push the bar using your chest muscles. Lock your arms in the contracted position, squeeze your chest, hold for a second and then start coming down slowly again. Tip: it should take at least twice as long to go down than to come up.', 'Repeat the movement for the prescribed amount of repetitions.', 'When you are done, place the bar back in the rack.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-incline-bench-press-medium-grip';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Incline_Bench_Press_-_Medium_Grip/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Incline_Bench_Press_-_Medium_Grip/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Incline Shoulder Raise', 'barbell-incline-shoulder-raise', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Lie back on an Incline Bench. Using a medium width grip (a grip that is slightly wider than shoulder width), lift the bar from the rack and hold it straight over you with your arms straight. This will be your starting position.', 'While keeping the arms straight, lift the bar by protracting your shoulder blades, raising the shoulders from the bench as you breathe out.', 'Bring back the bar to the starting position as you breathe in.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-incline-shoulder-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Incline_Shoulder_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Incline_Shoulder_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Lunge', 'barbell-lunge', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['This exercise is best performed inside a squat rack for safety purposes. To begin, first set the bar on a rack just below shoulder level. Once the correct height is chosen and the bar is loaded, step under the bar and place the back of your shoulders (slightly below the neck) across it.', 'Hold on to the bar using both arms at each side and lift it off the rack by first pushing with your legs and at the same time straightening your torso.', 'Step away from the rack and step forward with your right leg and squat down through your hips, while keeping the torso upright and maintaining balance. Inhale as you go down. Note: Do not allow your knee to go forward beyond your toes as you come down, as this will put undue stress on the knee joint. li>', 'Using mainly the heel of your foot, push up and go back to the starting position as you exhale.', 'Repeat the movement for the recommended amount of repetitions and then perform with the left leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-lunge';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Lunge/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Lunge/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Rear Delt Row', 'barbell-rear-delt-row', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Stand up straight while holding a barbell using a wide (higher than shoulder width) and overhand (palms facing your body) grip.', 'Bend knees slightly and bend over as you keep the natural arch of your back. Let the arms hang in front of you as they hold the bar. Once your torso is parallel to the floor, flare the elbows out and away from your body. Tip: Your torso and your arms should resemble the letter "T". Now you are ready to begin the exercise.', 'While keeping the upper arms perpendicular to the torso, pull the barbell up towards your upper chest as you squeeze the rear delts and you breathe out. Tip: When performed correctly, this exercise should resemble a bench press in reverse. Also, refrain from using your biceps to do the work. Focus on targeting the rear delts; the arms should only act as hooks.', 'Slowly go back to the initial position as you breathe in.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-rear-delt-row';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Rear_Delt_Row/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Rear_Delt_Row/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Rollout from Bench', 'barbell-rollout-from-bench', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Place a loaded barbell on the ground, near the end of a bench. Kneel with both legs on the bench, and take a medium to narrow grip on the barbell. This will be your starting position.', 'To begin, extend through the hips to slowly roll the bar forward. As you roll out, flex the shoulder to roll the bar above your head. Ensure that your arms remain extended throughout the movement.', 'When the bar has been moved as far forward as possible, return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-rollout-from-bench';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Rollout_from_Bench/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Rollout_from_Bench/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Seated Calf Raise', 'barbell-seated-calf-raise', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Place a block about 12 inches in front of a flat bench.', 'Sit on the bench and place the ball of your feet on the block.', 'Have someone place a barbell over your upper thighs about 3 inches above your knees and hold it there. This will be your starting position.', 'Raise up on your toes as high as possible as you squeeze the calves and as you breathe out.', 'After a second contraction, slowly go back to the starting position. Tip: To get maximum benefit stretch your calves as far as you can.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-seated-calf-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Seated_Calf_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Seated_Calf_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Shoulder Press', 'barbell-shoulder-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Sit on a bench with back support in a squat rack. Position a barbell at a height that is just above your head. Grab the barbell with a pronated grip (palms facing forward).', 'Once you pick up the barbell with the correct grip width, lift the bar up over your head by locking your arms. Hold at about shoulder level and slightly in front of your head. This is your starting position.', 'Lower the bar down to the shoulders slowly as you inhale.', 'Lift the bar back up to the starting position as you exhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-shoulder-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Shoulder_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Shoulder_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Shrug', 'barbell-shrug', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up straight with your feet at shoulder width as you hold a barbell with both hands in front of you using a pronated grip (palms facing the thighs). Tip: Your hands should be a little wider than shoulder width apart. You can use wrist wraps for this exercise for a better grip. This will be your starting position.', 'Raise your shoulders up as far as you can go as you breathe out and hold the contraction for a second. Tip: Refrain from trying to lift the barbell by using your biceps.', 'Slowly return to the starting position as you breathe in.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-shrug';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Shrug/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Shrug/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Shrug Behind The Back', 'barbell-shrug-behind-the-back', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up straight with your feet at shoulder width as you hold a barbell with both hands behind your back using a pronated grip (palms facing back). Tip: Your hands should be a little wider than shoulder width apart. You can use wrist wraps for this exercise for better grip. This will be your starting position.', 'Raise your shoulders up as far as you can go as you breathe out and hold the contraction for a second. Tip: Refrain from trying to lift the barbell by using your biceps. The arms should remain stretched out at all times.', 'Slowly return to the starting position as you breathe in.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-shrug-behind-the-back';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Shrug_Behind_The_Back/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Shrug_Behind_The_Back/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Side Bend', 'barbell-side-bend', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up straight while holding a barbell placed on the back of your shoulders (slightly below the neck). Your feet should be shoulder width apart. This will be your starting position.', 'While keeping your back straight and your head up, bend only at the waist to the right as far as possible. Breathe in as you bend to the side. Then hold for a second and come back up to the starting position as you exhale. Tip: Keep the rest of the body stationary.', 'Now repeat the movement but bending to the left instead. Hold for a second and come back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-side-bend';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Side_Bend/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Side_Bend/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Side Split Squat', 'barbell-side-split-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Stand up straight while holding a barbell placed on the back of your shoulders (slightly below the neck). Your feet should be placed wide apart with the foot of the lead leg angled out to the side. This will be your starting position.', 'Lower your body towards the side of your angled foot by bending the knee and hip of your lead leg and while keeping the opposite leg only slightly bent. Breathe in as you lower your body.', 'Return to the starting position by extending the hip and knee of the lead leg. Breathe out as you perform this movement.', 'After performing the recommended amount of reps, repeat the movement with the opposite leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-side-split-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Side_Split_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Side_Split_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Squat', 'barbell-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['This exercise is best performed inside a squat rack for safety purposes. To begin, first set the bar on a rack to just below shoulder level. Once the correct height is chosen and the bar is loaded, step under the bar and place the back of your shoulders (slightly below the neck) across it.', 'Hold on to the bar using both arms at each side and lift it off the rack by first pushing with your legs and at the same time straightening your torso.', 'Step away from the rack and position your legs using a shoulder width medium stance with the toes slightly pointed out. Keep your head up at all times and also maintain a straight back. This will be your starting position. (Note: For the purposes of this discussion we will use the medium stance described above which targets overall development; however you can choose any of the three stances discussed in the foot stances section).', 'Begin to slowly lower the bar by bending the knees and hips as you maintain a straight posture with the head up. Continue down until the angle between the upper leg and the calves becomes slightly less than 90-degrees. Inhale as you perform this portion of the movement. Tip: If you performed the exercise correctly, the front of the knees should make an imaginary straight line with the toes that is perpendicular to the front. If your knees are past that imaginary line (if they are past your toes) then you are placing undue stress on the knee and the exercise has been performed incorrectly.', 'Begin to raise the bar as you exhale by pushing the floor with the heel of your foot as you straighten the legs again and go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Squat To A Bench', 'barbell-squat-to-a-bench', NULL, v_category_id, 'strength', 'compound', 'push', 'advanced', ARRAY['This exercise is best performed inside a squat rack for safety purposes. To begin, first place a flat bench or a box behind you. The flat bench is used to teach you to set your hips back and to hit depth.', '', 'Then, set the bar on a rack that best matches your height. Once the correct height is chosen and the bar is loaded, step under the bar and place the back of your shoulders (slightly below the neck) across it.', 'Hold on to the bar using both arms at each side and lift it off the rack by first pushing with your legs and at the same time straightening your torso.', 'Step away from the rack and position your legs using a shoulder width medium stance with the toes slightly pointed out. Keep your head up at all times as looking down will get you off balance and also maintain a straight back. This will be your starting position. (Note: For the purposes of this discussion we will use the medium stance described above which targets overall development; however you can choose any of the three stances discussed in the foot stances section).', 'Begin to slowly lower the bar by bending the knees and sitting your hips back as you maintain a straight posture with the head up. Continue down until you slightly touch the bench behind you. Inhale as you perform this portion of the movement. Tip: If you performed the exercise correctly, the front of the knees should make an imaginary straight line with the toes that is perpendicular to the front. If your knees are past that imaginary line (if they are past your toes) then you are placing undue stress on the knee and the exercise has been performed incorrectly.', 'Begin to raise the bar as you exhale by pushing the floor with the heel of your foot as you straighten the legs and extend the hips to go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-squat-to-a-bench';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Squat_To_A_Bench/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Squat_To_A_Bench/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Step Ups', 'barbell-step-ups', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Stand up straight while holding a barbell placed on the back of your shoulders (slightly below the neck) and stand upright behind an elevated platform (such as the one used for spotting behind a flat bench). This is your starting position.', 'Place the right foot on the elevated platform. Step on the platform by extending the hip and the knee of your right leg. Use the heel mainly to lift the rest of your body up and place the foot of the left leg on the platform as well. Breathe out as you execute the force required to come up.', 'Step down with the left leg by flexing the hip and knee of the right leg as you inhale. Return to the original standing position by placing the right foot of to next to the left foot on the initial position.', 'Repeat with the right leg for the recommended amount of repetitions and then perform with the left leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-step-ups';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Step_Ups/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Step_Ups/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Walking Lunge', 'barbell-walking-lunge', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Begin standing with your feet shoulder width apart and a barbell across your upper back.', 'Step forward with one leg, flexing the knees to drop your hips. Descend until your rear knee nearly touches the ground. Your posture should remain upright, and your front knee should stay above the front foot.', 'Drive through the heel of your lead foot and extend both knees to raise yourself back up.', 'Step forward with your rear foot, repeating the lunge on the opposite leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-walking-lunge';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Walking_Lunge/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Walking_Lunge/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Battling Ropes', 'battling-ropes', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['For this exercise you will need a heavy rope anchored at its center 15-20 feet away. Standing in front of the rope, take an end in each hand with your arms extended at your side. This will be your starting position.', 'Initiate the movement by rapidly raising one arm to shoulder level as quickly as you can.', 'As you let that arm drop to the starting position, raise the opposite side.', 'Continue alternating your left and right arms, whipping the ropes up and down as fast as you can.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'battling-ropes';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Battling_Ropes/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Battling_Ropes/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bench Dips', 'bench-dips', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['For this exercise you will need to place a bench behind your back. With the bench perpendicular to your body, and while looking away from it, hold on to the bench on its edge with the hands fully extended, separated at shoulder width. The legs will be extended forward, bent at the waist and perpendicular to your torso. This will be your starting position.', 'Slowly lower your body as you inhale by bending at the elbows until you lower yourself far enough to where there is an angle slightly smaller than 90 degrees between the upper arm and the forearm. Tip: Keep the elbows as close as possible throughout the movement. Forearms should always be pointing down.', 'Using your triceps to bring your torso up again, lift yourself back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bench-dips';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Dips/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Dips/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bench Press - With Bands', 'bench-press-with-bands', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Using a flat bench secure a band under the leg of the bench that is nearest to your head.', 'Once the band is secure, grab it by both handles and lie down on the bench.', 'Extend your arms so that you are holding the band handles in front of you at shoulder width.', 'Once at shoulder width, rotate your wrists forward so that the palms of your hands are facing away from you. This will be your starting position.', 'Bring down the handles slowly until your elbow forms a 90 degree angle. Keep full control at all times.', 'As you breathe out, bring the handles up using your pectoral muscles. Lock your arms in the contracted position, squeeze your chest, hold for a second and then start coming down slowly. Tip: It should take at least twice as long to go down than to come up.', 'Repeat the movement for the prescribed amount of repetitions of your training program.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bench-press-with-bands';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Resistance Band' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Press_-_With_Bands/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Press_-_With_Bands/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bent Over Barbell Row', 'bent-over-barbell-row', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Holding a barbell with a pronated grip (palms facing down), bend your knees slightly and bring your torso forward, by bending at the waist, while keeping the back straight until it is almost parallel to the floor. Tip: Make sure that you keep the head up. The barbell should hang directly in front of you as your arms hang perpendicular to the floor and your torso. This is your starting position.', 'Now, while keeping the torso stationary, breathe out and lift the barbell to you. Keep the elbows close to the body and only use the forearms to hold the weight. At the top contracted position, squeeze the back muscles and hold for a brief pause.', 'Then inhale and slowly lower the barbell back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bent-over-barbell-row';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Barbell_Row/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Barbell_Row/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bent Over Dumbbell Rear Delt Raise With Head On Bench', 'bent-over-dumbbell-rear-delt-raise-with-head-on-bench', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up straight while holding a dumbbell in each hand and with an incline bench in front of you.', 'While keeping your back straight and maintaining the natural arch of your back, lean forward until your forehead touches the bench in front of you. Let the arms hang in front of you perpendicular to the ground. The palms of your hands should be facing each other and your torso should be parallel to the floor. This will be your starting position.', 'Keeping your torso forward and stationary, and the arms straight with a slight bend at the elbows, lift the dumbbells straight to the side until both arms are parallel to the floor. Exhale as you lift the weights. Caution: avoid swinging the torso or bringing the arms back as opposed to the side.', 'After a one second contraction at the top, slowly lower the dumbbells back to the starting position.', 'Repeat the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bent-over-dumbbell-rear-delt-raise-with-head-on-bench';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Dumbbell_Rear_Delt_Raise_With_Head_On_Bench/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Dumbbell_Rear_Delt_Raise_With_Head_On_Bench/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bent Over Low-Pulley Side Lateral', 'bent-over-low-pulley-side-lateral', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Select a weight and hold the handle of the low pulley with your right hand.', 'Bend at the waist until your torso is nearly parallel to the floor. Your legs should be slightly bent with your left hand placed on your lower left thigh. Your right arm should be hanging from your shoulder in front of you and with a slight bend at the elbow. This will be your starting position.', 'Raise your right arm, elbow slightly bent, to the side until the arm is parallel to the floor and in line with your right ear. Breathe out as you perform this step.', 'Slowly lower the weight back to the starting position as you breathe in.', 'Repeat for the recommended amount of repetitions and repeat the movement with the other arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bent-over-low-pulley-side-lateral';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Low-Pulley_Side_Lateral/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Low-Pulley_Side_Lateral/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bent Over One-Arm Long Bar Row', 'bent-over-one-arm-long-bar-row', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Put weight on one of the ends of an Olympic barbell. Make sure that you either place the other end of the barbell in the corner of two walls; or put a heavy object on the ground so the barbell cannot slide backward.', 'Bend forward until your torso is as close to parallel with the floor as you can and keep your knees slightly bent.', 'Now grab the bar with one arm just behind the plates on the side where the weight was placed and put your other hand on your knee. This will be your starting position.', 'Pull the bar straight up with your elbow in (to maximize back stimulation) until the plates touch your lower chest. Squeeze the back muscles as you lift the weight up and hold for a second at the top of the movement. Breathe out as you lift the weight. Tip: Do not allow for any swinging of the torso. Only the arm should move.', 'Slowly lower the bar to the starting position getting a nice stretch on the lats. Tip: Do not let the plates touch the floor. To ensure the best range of motion, I recommend using small plates (25-lb ones) as opposed to larger plates (like 35-45lb ones).', 'Repeat for the recommended amount of repetitions and switch arms.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bent-over-one-arm-long-bar-row';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_One-Arm_Long_Bar_Row/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_One-Arm_Long_Bar_Row/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bent Over Two-Arm Long Bar Row', 'bent-over-two-arm-long-bar-row', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Put weight on one of the ends of an Olympic barbell. Make sure that you either place the other end of the barbell in the corner of two walls; or put a heavy object on the ground so the barbell cannot slide backward.', 'Bend forward until your torso is as close to parallel with the floor as you can and keep your knees slightly bent.', 'Now grab the bar with both arms just behind the plates on the side where the weight was placed and put your other hand on your knee. This will be your starting position.', 'Pull the bar straight up with your elbows in (to maximize back stimulation) until the plates touch your lower chest. Squeeze the back muscles as you lift the weight up and hold for a second at the top of the movement. Breathe out as you lift the weight. Tip: Use a stirrup or double handle cable attachment by hooking it under the end of the bar.', 'Slowly lower the bar to the starting position getting a nice stretch on the lats. Tip: Do not let the plates touch the floor. To ensure the best range of motion, I recommend using small plates (25-lb ones) as opposed to larger plates (like 35-45lb ones).', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bent-over-two-arm-long-bar-row';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Two-Arm_Long_Bar_Row/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Two-Arm_Long_Bar_Row/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bent Over Two-Dumbbell Row', 'bent-over-two-dumbbell-row', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['With a dumbbell in each hand (palms facing your torso), bend your knees slightly and bring your torso forward by bending at the waist; as you bend make sure to keep your back straight until it is almost parallel to the floor. Tip: Make sure that you keep the head up. The weights should hang directly in front of you as your arms hang perpendicular to the floor and your torso. This is your starting position.', 'While keeping the torso stationary, lift the dumbbells to your side (as you breathe out), keeping the elbows close to the body (do not exert any force with the forearm other than holding the weights). On the top contracted position, squeeze the back muscles and hold for a second.', 'Slowly lower the weight again to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bent-over-two-dumbbell-row';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Two-Dumbbell_Row/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Two-Dumbbell_Row/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bent Over Two-Dumbbell Row With Palms In', 'bent-over-two-dumbbell-row-with-palms-in', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['With a dumbbell in each hand (palms facing each other), bend your knees slightly and bring your torso forward, by bending at the waist, while keeping the back straight until it is almost parallel to the floor. Tip: Make sure that you keep the head up. The weights should hang directly in front of you as your arms hang perpendicular to the floor and your torso. This is your starting position.', 'While keeping the torso stationary, lift the dumbbells to your side as you breathe out, squeezing your shoulder blades together. On the top contracted position, squeeze the back muscles and hold for a second.', 'Slowly lower the weight again to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bent-over-two-dumbbell-row-with-palms-in';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Two-Dumbbell_Row_With_Palms_In/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Over_Two-Dumbbell_Row_With_Palms_In/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bent Press', 'bent-press', NULL, v_category_id, 'strength', 'compound', 'pull', 'advanced', ARRAY['Clean a kettlebell to your shoulder. Clean the kettlebell to your shoulders by extending through the legs and hips as you raise the kettlebell towards your shoulder. The wrist should rotate as you do so. This will be your starting position.', 'Begin my leaning to the side opposite the kettlebell, continuing until you are able to touch the ground with your free hand, keeping your eyes on the kettlebell. As you do so, press the weight vertically be extending through the elbow, keeping your arm perpendicular to the ground.', 'Return to an upright position, with the kettlebell above your head. Return the kettlebell to the shoulder and repeat for the desired number of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bent-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bent-Arm Barbell Pullover', 'bent-arm-barbell-pullover', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Lie on a flat bench with a barbell using a shoulder grip width.', 'Hold the bar straight over your chest with a bend in your arms. This will be your starting position.', 'While keeping your arms in the bent arm position, lower the weight slowly in an arc behind your head while breathing in until you feel a stretch on the chest.', 'At that point, bring the barbell back to the starting position using the arc through which the weight was lowered and exhale as you perform this movement.', 'Hold the weight on the initial position for a second and repeat the motion for the prescribed number of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bent-arm-barbell-pullover';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent-Arm_Barbell_Pullover/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent-Arm_Barbell_Pullover/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bent-Arm Dumbbell Pullover', 'bent-arm-dumbbell-pullover', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Place a dumbbell standing up on a flat bench.', 'Ensuring that the dumbbell stays securely placed at the top of the bench, lie perpendicular to the bench (torso across it as in forming a cross) with only your shoulders lying on the surface. Hips should be below the bench and legs bent with feet firmly on the floor. The head will be off the bench as well.', 'Grasp the dumbbell with both hands and hold it straight over your chest with a bend in your arms. Both palms should be pressing against the underside one of the sides of the dumbbell. This will be your starting position. Caution: Always ensure that the dumbbell used for this exercise is secure. Using a dumbbell with loose plates can result in the dumbbell falling apart and falling on your face.', 'While keeping your arms locked in the bent arm position, lower the weight slowly in an arc behind your head while breathing in until you feel a stretch on the chest.', 'At that point, bring the dumbbell back to the starting position using the arc through which the weight was lowered and exhale as you perform this movement.', 'Hold the weight on the initial position for a second and repeat the motion for the prescribed number of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bent-arm-dumbbell-pullover';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent-Arm_Dumbbell_Pullover/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent-Arm_Dumbbell_Pullover/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bent-Knee Hip Raise', 'bent-knee-hip-raise', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Lay flat on the floor with your arms next to your sides.', 'Now bend your knees at around a 75 degree angle and lift your feet off the floor by around 2 inches.', 'Using your lower abs, bring your knees in towards you as you maintain the 75 degree angle bend in your legs. Continue this movement until you raise your hips off of the floor by rolling your pelvis backward. Breathe out as you perform this portion of the movement. Tip: At the end of the movement your knees will be over your chest.', 'Squeeze your abs at the top of the movement for a second and then return to the starting position slowly as you breathe in. Tip: Maintain a controlled motion at all times.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bent-knee-hip-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent-Knee_Hip_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bent-Knee_Hip_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Body Tricep Press', 'body-tricep-press', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Position a bar in a rack at chest height.', 'Standing, take a shoulder width grip on the bar and step a yard or two back, feet together and arms extended so that you are leaning on the bar. This will be your starting position.', 'Begin by flexing the elbow, lowering yourself towards the bar.', 'Pause, and then reverse the motion by extending the elbows.', 'Progress from bodyweight by adding chains over your shoulders.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'body-tricep-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Body_Tricep_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Body_Tricep_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Body-Up', 'body-up', NULL, v_category_id, 'strength', 'isolation', 'push', 'intermediate', ARRAY['Assume a plank position on the ground. You should be supporting your bodyweight on your toes and forearms, keeping your torso straight. Your forearms should be shoulder-width apart. This will be your starting position.', 'Pressing your palms firmly into the ground, extend through the elbows to raise your body from the ground. Keep your torso rigid as you perform the movement.', 'Slowly lower your forearms back to the ground by allowing the elbows to flex.', 'Repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'body-up';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Body-Up/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Body-Up/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bodyweight Flyes', 'bodyweight-flyes', NULL, v_category_id, 'strength', 'isolation', 'push', 'intermediate', ARRAY['Position two equally loaded EZ bars on the ground next to each other. Ensure they are able to roll.', 'Assume a push-up position over the bars, supporting your weight on your toes and hands with your arms extended and body straight.', 'Place your hands on the bars. This will be your starting position.', 'Using a slow and controlled motion, move your hands away from the midline of your body, rolling the bars apart. Inhale during this portion of the motion.', 'After moving the bars as far apart as you can, return to the starting position by pulling them back together. Exhale as you perform this movement.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bodyweight-flyes';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'EZ Curl Bar' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bodyweight_Flyes/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bodyweight_Flyes/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bodyweight Mid Row', 'bodyweight-mid-row', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Begin by taking a medium to wide grip on a pull-up apparatus with your palms facing away from you. From a hanging position, tuck your knees to your chest, leaning back and getting your legs over your side of the pull-up apparatus. This will be your starting position.', 'Beginning with your arms straight, flex the elbows and retract the shoulder blades to raise your body up until your legs contact the pull-up apparatus.', 'After a brief pause, return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bodyweight-mid-row';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bodyweight_Mid_Row/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bodyweight_Mid_Row/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bodyweight Squat', 'bodyweight-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Stand with your feet shoulder width apart. You can place your hands behind your head. This will be your starting position.', 'Begin the movement by flexing your knees and hips, sitting back with your hips.', 'Continue down to full depth if you are able,and quickly reverse the motion until you return to the starting position. As you squat, keep your head and chest up and push your knees out.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bodyweight-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bodyweight_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bodyweight_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bodyweight Walking Lunge', 'bodyweight-walking-lunge', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Begin standing with your feet shoulder width apart and your hands on your hips.', 'Step forward with one leg, flexing the knees to drop your hips. Descend until your rear knee nearly touches the ground. Your posture should remain upright, and your front knee should stay above the front foot.', 'Drive through the heel of your lead foot and extend both knees to raise yourself back up.', 'Step forward with your rear foot, repeating the lunge on the opposite leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bodyweight-walking-lunge';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bodyweight_Walking_Lunge/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bodyweight_Walking_Lunge/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bosu Ball Cable Crunch With Side Bends', 'bosu-ball-cable-crunch-with-side-bends', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Connect a standard handle to each arm of a cable machine, and position them in the most downward position.', 'Grab a Bosu Ball and position it in front and center of the cable machine.', 'Lie down on the Bosu Ball with the small of your back arched around the ball. Your rear end should be close to the floor without touching it.', 'With both hands, reach back and grab the handle of each cable.', 'With your feet positioned in a wide stance, extend your arms straight out in front of you and in between your knees. Your hands should be at knee level.', 'Keep your arms straight and in-line with the upward angle of the cable. Elevate your torso in a crunching motion without dropping or bending your arms.', 'Maintain the rigid position with your arms. Slowly descend back to the starting position with your back arched around the Bosu Ball and your abdominals elongated.', 'Repeat the same series of movements to failure.', 'Once you reach failure, keep your abs tight and raise your torso into plank position so your back is elevated off the Bosu Ball.', 'Lower your arms down to your side; keep them straight. Start doing alternating side bends; reach for your heels! This finishing movement will focus on your obliques.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bosu-ball-cable-crunch-with-side-bends';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bosu_Ball_Cable_Crunch_With_Side_Bends/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bosu_Ball_Cable_Crunch_With_Side_Bends/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bottoms Up', 'bottoms-up', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Begin by lying on your back on the ground. Your legs should be straight and your arms at your side. This will be your starting position.', 'To perform the movement, tuck the knees toward your chest by flexing the hips and knees. Following this, extend your legs directly above you so that they are perpendicular to the ground. Rotate and elevate your pelvis to raise your glutes from the floor.', 'After a brief pause, return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bottoms-up';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bottoms_Up/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bottoms_Up/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bottoms-Up Clean From The Hang Position', 'bottoms-up-clean-from-the-hang-position', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Initiate the exercise by standing upright with a kettlebell in one hand.', 'Swing the kettlebell back forcefully and then reverse the motion forcefully. Crush the kettlebell handle as hard as possible and raise the kettlebell to your shoulder.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bottoms-up-clean-from-the-hang-position';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bottoms-Up_Clean_From_The_Hang_Position/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bottoms-Up_Clean_From_The_Hang_Position/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Box Squat with Chains', 'box-squat-with-chains', NULL, v_category_id, 'strength', 'compound', 'push', 'advanced', ARRAY['Begin in a power rack with a box at the appropriate height behind you. Typically, you would aim for a box height that brings you to a parallel squat, but you can train higher or lower if desired.', 'To set up the chains, begin by looping the leader chain over the sleeves of the bar. The heavy chain should be attached using a snap hook. Adjust the length of the lead chain so that a few links are still on the floor at the top of the movement.', 'Begin by stepping under the bar and placing it across the back of the shoulders. Squeeze your shoulder blades together and rotate your elbows forward, attempting to bend the bar across your shoulders. Remove the bar from the rack, creating a tight arch in your lower back, and step back into position. Place your feet wider for more emphasis on the back, glutes, adductors, and hamstrings, or closer together for more quad development. Keep your head facing forward.', 'With your back, shoulders, and core tight, push your knees and butt out and you begin your descent. Sit back with your hips until you are seated on the box. Ideally, your shins should be perpendicular to the ground. Pause when you reach the box, and relax the hip flexors. Never bounce off of a box.', 'Keeping the weight on your heels and pushing your feet and knees out, drive upward off of the box as you lead the movement with your head. Continue upward, maintaining tightness head to toe.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'box-squat-with-chains';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Box_Squat_with_Chains/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Box_Squat_with_Chains/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bradford/Rocky Presses', 'bradford-rocky-presses', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Sit on a Military Press Bench with a bar at shoulder level with a pronated grip (palms facing forward). Tip: Your grip should be wider than shoulder width and it should create a 90-degree angle between the forearm and the upper arm as the barbell goes down. This is your starting position.', 'Once you pick up the barbell with the correct grip, lift the bar up over your head by locking your arms.', 'Now lower the bar down to the back of the head slowly as you inhale.', 'Lift the bar back up to the starting position as you exhale.', 'Lower the bar down to the starting position slowly as you inhale. This is one repetition.', 'Alternate in this manner until you complete the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bradford-rocky-presses';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bradford_Rocky_Presses/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bradford_Rocky_Presses/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Butt Lift (Bridge)', 'butt-lift-bridge', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Lie flat on the floor on your back with the hands by your side and your knees bent. Your feet should be placed around shoulder width. This will be your starting position.', 'Pushing mainly with your heels, lift your hips off the floor while keeping your back straight. Breathe out as you perform this part of the motion and hold at the top for a second.', 'Slowly go back to the starting position as you breathe in.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'butt-lift-bridge';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Butt_Lift_Bridge/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Butt_Lift_Bridge/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Butt-Ups', 'butt-ups', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Begin a pushup position but with your elbows on the ground and resting on your forearms. Your arms should be bent at a 90 degree angle.', 'Arch your back slightly out rather than keeping your back completely straight.', 'Raise your glutes toward the ceiling, squeezing your abs tightly to close the distance between your ribcage and hips. The end result will be that you''ll end up in a high bridge position. Exhale as you perform this portion of the movement.', 'Lower back down slowly to your starting position as you breathe in. Tip: Don''t let your back sag downwards.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'butt-ups';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Butt-Ups/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Butt-Ups/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Butterfly', 'butterfly', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Sit on the machine with your back flat on the pad.', 'Take hold of the handles. Tip: Your upper arms should be positioned parallel to the floor; adjust the machine accordingly. This will be your starting position.', 'Push the handles together slowly as you squeeze your chest in the middle. Breathe out during this part of the motion and hold the contraction for a second.', 'Return back to the starting position slowly as you inhale until your chest muscles are fully stretched.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'butterfly';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Machine' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Butterfly/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Butterfly/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Chest Press', 'cable-chest-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Adjust the weight to an appropriate amount and be seated, grasping the handles. Your upper arms should be about 45 degrees to the body, with your head and chest up. The elbows should be bent to about 90 degrees. This will be your starting position.', 'Begin by extending through the elbow, pressing the handles together straight in front of you. Keep your shoulder blades retracted as you execute the movement.', 'After pausing at full extension, return to th starting position, keeping tension on the cables.', 'You can also execute this movement with your back off the pad, at an incline or decline, or alternate hands.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-chest-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Chest_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Chest_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Crossover', 'cable-crossover', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['To get yourself into the starting position, place the pulleys on a high position (above your head), select the resistance to be used and hold the pulleys in each hand.', 'Step forward in front of an imaginary straight line between both pulleys while pulling your arms together in front of you. Your torso should have a small forward bend from the waist. This will be your starting position.', 'With a slight bend on your elbows in order to prevent stress at the biceps tendon, extend your arms to the side (straight out at both sides) in a wide arc until you feel a stretch on your chest. Breathe in as you perform this portion of the movement. Tip: Keep in mind that throughout the movement, the arms and torso should remain stationary; the movement should only occur at the shoulder joint.', 'Return your arms back to the starting position as you breathe out. Make sure to use the same arc of motion used to lower the weights.', 'Hold for a second at the starting position and repeat the movement for the prescribed amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-crossover';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Crossover/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Crossover/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Crunch', 'cable-crunch', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Kneel below a high pulley that contains a rope attachment.', 'Grasp cable rope attachment and lower the rope until your hands are placed next to your face.', 'Flex your hips slightly and allow the weight to hyperextend the lower back. This will be your starting position.', 'With the hips stationary, flex the waist as you contract the abs so that the elbows travel towards the middle of the thighs. Exhale as you perform this portion of the movement and hold the contraction for a second.', 'Slowly return to the starting position as you inhale. Tip: Make sure that you keep constant tension on the abs throughout the movement. Also, do not choose a weight so heavy that the lower back handles the brunt of the work.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-crunch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Crunch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Crunch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Deadlifts', 'cable-deadlifts', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Move the cables to the bottom of the towers and select an appropriate weight. Stand directly in between the uprights.', 'To begin, squat down be flexing your hips and knees until you can reach the handles.', 'After grasping them, begin your ascent. Driving through your heels extend your hips and knees keeping your hands hanging at your side. Keep your head and chest up throughout the movement.', 'After reaching a full standing position, Return to the starting position and repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-deadlifts';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Deadlifts/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Deadlifts/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Hammer Curls - Rope Attachment', 'cable-hammer-curls-rope-attachment', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Attach a rope attachment to a low pulley and stand facing the machine about 12 inches away from it.', 'Grasp the rope with a neutral (palms-in) grip and stand straight up keeping the natural arch of the back and your torso stationary.', 'Put your elbows in by your side and keep them there stationary during the entire movement. Tip: Only the forearms should move; not your upper arms. This will be your starting position.', 'Using your biceps, pull your arms up as you exhale until your biceps touch your forearms. Tip: Remember to keep the elbows in and your upper arms stationary.', 'After a 1 second contraction where you squeeze your biceps, slowly start to bring the weight back to the original position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-hammer-curls-rope-attachment';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Hammer_Curls_-_Rope_Attachment/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Hammer_Curls_-_Rope_Attachment/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Hip Adduction', 'cable-hip-adduction', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand in front of a low pulley facing forward with one leg next to the pulley and the other one away.', 'Attach the ankle cuff to the cable and also to the ankle of the leg that is next to the pulley.', 'Now step out and away from the stack with a wide stance and grasp the bar of the pulley system.', 'Stand on the foot that does not have the ankle cuff (the far foot) and allow the leg with the cuff to be pulled towards the low pulley. This will be your starting position.', 'Now perform the movement by moving the leg with the ankle cuff in front of the far leg by using the inner thighs to abduct the hip. Breathe out during this portion of the movement.', 'Slowly return to the starting position as you breathe in.', 'Repeat for the recommended amount of repetitions and then repeat the same movement with the opposite leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-hip-adduction';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Hip_Adduction/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Hip_Adduction/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Incline Pushdown', 'cable-incline-pushdown', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Lie on incline an bench facing away from a high pulley machine that has a straight bar attachment on it.', 'Grasp the straight bar attachment overhead with a pronated (overhand; palms down) shoulder width grip and extend your arms in front of you. The bar should be around 2 inches away from your upper thighs. This will be your starting position.', 'Keeping the upper arms stationary, lift your arms back in a semi circle until the bar is straight over your head. Breathe in during this portion of the movement.', 'Slowly go back to the starting position using your lats and hold the contraction once you reach the starting position. Breathe out during the execution of this movement.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-incline-pushdown';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Incline_Pushdown/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Incline_Pushdown/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Incline Triceps Extension', 'cable-incline-triceps-extension', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Lie on incline an bench facing away from a high pulley machine that has a straight bar attachment on it.', 'Grasp the straight bar attachment overhead with a pronated (overhand; palms down) narrow grip (less than shoulder width) and keep your elbows tucked in to your sides. Your upper arms should create around a 25 degree angle when measured from the floor.', 'Keeping the upper arms stationary, extend the arms as you flex the triceps. Breathe out during this portion of the movement and hold the contraction for a second.', 'Slowly go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-incline-triceps-extension';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Incline_Triceps_Extension/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Incline_Triceps_Extension/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Internal Rotation', 'cable-internal-rotation', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Sit next to a low pulley sideways (with legs stretched in front of you or crossed) and grasp the single hand cable attachment with the arm nearest to the cable. Tip: If you can adjust the pulley''s height, you can use a flat bench to sit on instead.', 'Position the elbow against your side with the elbow bent at 90° and the arm pointing towards the pulley. This will be your starting position.', 'Pull the single hand cable attachment toward your body by internally rotating your shoulder until your forearm is across your abs. You will be creating an imaginary semi-circle. Tip: The forearm should be perpendicular to your torso at all times.', 'Slowly go back to the initial position.', 'Repeat for the recommended amount of repetitions and then repeat the movement with the next arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-internal-rotation';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Internal_Rotation/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Internal_Rotation/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Iron Cross', 'cable-iron-cross', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Begin by moving the pulleys to the high position, select the resistance to be used, and take a handle in each hand.', 'Stand directly between both pulleys with your arms extended out to your sides. Your head and chest should be up while your arms form a "T". This will be your starting position.', 'Keeping the elbows extended, pull your arms straight to your sides.', 'Return your arms back to the starting position after a pause at the peak contraction.', 'Continue the movement for the prescribed number of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-iron-cross';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Iron_Cross/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Iron_Cross/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Judo Flip', 'cable-judo-flip', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Connect a rope attachment to a tower, and move the cable to the lowest pulley position. Stand with your side to the cable with a wide stance, and grab the rope with both hands.', 'Twist your body away from the pulley as you bring the rope over your shoulder like you''re performing a judo flip.', 'Shift your weight between your feet as you twist and crunch forward, pulling the cable downward.', 'Return to the starting position and repeat until failure.', 'Then, reposition and repeat the same series of movements on the opposite side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-judo-flip';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Judo_Flip/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Judo_Flip/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Lying Triceps Extension', 'cable-lying-triceps-extension', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Lie on a flat bench and grasp the straight bar attachment of a low pulley with a narrow overhand grip. Tip: The easiest way to do this is to have someone hand you the bar as you lay down.', 'With your arms extended, position the bar over your torso. Your arms and your torso should create a 90-degree angle. This will be your starting position.', 'Lower the bar by bending at the elbow while keeping the upper arms stationary and elbows in. Go down until the bar lightly touches your forehead. Breathe in as you perform this portion of the movement.', 'Flex the triceps as you lift the bar back to its starting position. Exhale as you perform this portion of the movement.', 'Hold for a second at the contracted position and repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-lying-triceps-extension';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Lying_Triceps_Extension/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Lying_Triceps_Extension/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable One Arm Tricep Extension', 'cable-one-arm-tricep-extension', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['With your right hand, grasp a single handle attached to the high-cable pulley using a supinated (underhand; palms facing up) grip. You should be standing directly in front of the weight stack.', 'Now pull the handle down so that your upper arm and elbow are locked in to the side of your body. Your upper arm and forearm should form an acute angle (less than 90-degrees). You can keep the other arm by the waist and you can have one leg in front of you and the other one back for better balance. This will be your starting position.', 'As you contract the triceps, move the single handle attachment down to your side until your arm is straight. Breathe out as you perform this movement. Tip: Only the forearms should move. Your upper arms should remain stationary at all times.', 'Squeeze the triceps and hold for a second in this contracted position.', 'Slowly return the handle to the starting position.', 'Repeat for the recommended amount of repetitions and then perform the same movement with the other arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-one-arm-tricep-extension';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_One_Arm_Tricep_Extension/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_One_Arm_Tricep_Extension/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Preacher Curl', 'cable-preacher-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Place a preacher bench about 2 feet in front of a pulley machine.', 'Attach a straight bar to the low pulley.', 'Sit at the preacher bench with your elbow and upper arms firmly on top of the bench pad and have someone hand you the bar from the low pulley.', 'Grab the bar and fully extend your arms on top of the preacher bench pad. This will be your starting position.', 'Now start pilling the weight up towards your shoulders and squeeze the biceps hard at the top of the movement. Exhale as you perform this motion. Also, hold for a second at the top.', 'Now slowly lower the weight to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-preacher-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Preacher_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Preacher_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Rear Delt Fly', 'cable-rear-delt-fly', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Adjust the pulleys to the appropriate height and adjust the weight. The pulleys should be above your head.', 'Grab the left pulley with your right hand and the right pulley with your left hand, crossing them in front of you. This will be your starting position.', 'Initiate the movement by moving your arms back and outward, keeping your arms straight as you execute the movement.', 'Pause at the end of the motion before returning the handles to the start position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-rear-delt-fly';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Rear_Delt_Fly/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Rear_Delt_Fly/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Reverse Crunch', 'cable-reverse-crunch', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Connect an ankle strap attachment to a low pulley cable and position a mat on the floor in front of it.', 'Sit down with your feet toward the pulley and attach the cable to your ankles.', 'Lie down, elevate your legs and bend your knees at a 90-degree angle. Your legs and the cable should be aligned. If not, adjust the pulley up or down until they are.', 'With your hands behind your head, bring your knees inward to your torso and elevate your hips off the floor.', 'Pause for a moment and in a slow and controlled manner drop your hips and bring your legs back to the starting 90-degree angle. You should still have tension on your abs in the resting position.', 'Repeat the same movement to failure.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-reverse-crunch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Reverse_Crunch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Reverse_Crunch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Rope Overhead Triceps Extension', 'cable-rope-overhead-triceps-extension', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Attach a rope to the bottom pulley of the pulley machine.', 'Grasping the rope with both hands, extend your arms with your hands directly above your head using a neutral grip (palms facing each other). Your elbows should be in close to your head and the arms should be perpendicular to the floor with the knuckles aimed at the ceiling. This will be your starting position.', 'Slowly lower the rope behind your head as you hold the upper arms stationary. Inhale as you perform this movement and pause when your triceps are fully stretched.', 'Return to the starting position by flexing your triceps as you breathe out.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-rope-overhead-triceps-extension';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Rope_Overhead_Triceps_Extension/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Rope_Overhead_Triceps_Extension/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Rope Rear-Delt Rows', 'cable-rope-rear-delt-rows', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Sit in the same position on a low pulley row station as you would if you were doing seated cable rows for the back.', 'Attach a rope to the pulley and grasp it with an overhand grip. Your arms should be extended and parallel to the floor with the elbows flared out.', 'Keep your lower back upright and slide your hips back so that your knees are slightly bent. This will be your starting position.', 'Pull the cable attachment towards your upper chest, just below the neck, as you keep your elbows up and out to the sides. Continue this motion as you exhale until the elbows travel slightly behind the back. Tip: Keep your upper arms horizontal, perpendicular to the torso and parallel to the floor throughout the motion.', 'Go back to the initial position where the arms are extended and the shoulders are stretched forward. Inhale as you perform this portion of the movement.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-rope-rear-delt-rows';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Rope_Rear-Delt_Rows/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Rope_Rear-Delt_Rows/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Russian Twists', 'cable-russian-twists', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Connect a standard handle attachment, and position the cable to a middle pulley position.', 'Lie on a stability ball perpendicular to the cable and grab the handle with one hand. You should be approximately arm''s length away from the pulley, with the tension of the weight on the cable.', 'Grab the handle with both hands and fully extend your arms above your chest. You hands should be directly in-line with the pulley. If not, adjust the pulley up or down until they are.', 'Keep your hips elevated and abs engaged. Rotate your torso away from the pulley for a full-quarter rotation. Your body should be flat from head to knees.', 'Pause for a moment and in a slow and controlled manner reset to the starting position. You should still have side tension on the cable in the resting position.', 'Repeat the same movement to failure.', 'Then, reposition and repeat the same series of movements on the opposite side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-russian-twists';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Russian_Twists/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Russian_Twists/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Seated Crunch', 'cable-seated-crunch', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Seat on a flat bench with your back facing a high pulley.', 'Grasp the cable rope attachment with both hands (with the palms of the hands facing each other) and place your hands securely over both shoulders. Tip: Allow the weight to hyperextend the lower back slightly. This will be your starting position.', 'With the hips stationary, flex the waist so the elbows travel toward the hips. Breathe out as you perform this step.', 'As you inhale, go back to the initial position slowly.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-seated-crunch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Seated_Crunch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Seated_Crunch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Seated Lateral Raise', 'cable-seated-lateral-raise', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand in the middle of two low pulleys that are opposite to each other and place a flat bench right behind you (in perpendicular fashion to you; the narrow edge of the bench should be the one behind you). Select the weight to be used on each pulley.', 'Now sit at the edge of the flat bench behind you with your feet placed in front of your knees.', 'Bend forward while keeping your back flat and rest your torso on the thighs.', 'Have someone give you the single handles attached to the pulleys. Grasp the left pulley with the right hand and the right pulley with the left after you select your weight. The pulleys should run under your knees and your arms will be extended with palms facing each other and a slight bend at the elbows. This will be the starting position.', 'While keeping the arms stationary, raise the upper arms to the sides until they are parallel to the floor and at shoulder height. Exhale during the execution of this movement and hold the contraction for a second.', 'Slowly lower your arms to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions. Tip: Maintain upper arms perpendicular to torso and a fixed elbow position (10 degree to 30 degree angle) throughout exercise.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-seated-lateral-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Seated_Lateral_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Seated_Lateral_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Shoulder Press', 'cable-shoulder-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Move the cables to the bottom of the towers and select an appropriate weight.', 'Stand directly in between the uprights. Grasp the cables and hold them at shoulder height, palms facing forward. This will be your starting position.', 'Keeping your head and chest up, extend through the elbow to press the handles directly over head.', 'After pausing at the top, return to the starting position and repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-shoulder-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Shoulder_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Shoulder_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Shrugs', 'cable-shrugs', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Grasp a cable bar attachment that is attached to a low pulley with a shoulder width or slightly wider overhand (palms facing down) grip.', 'Stand erect close to the pulley with your arms extended in front of you holding the bar. This will be your starting position.', 'Lift the bar by elevating the shoulders as high as possible as you exhale. Hold the contraction at the top for a second. Tip: The arms should remain extended at all times. Refrain from using the biceps to help lift the bar. Only the shoulders should be moving up and down.', 'Lower the bar back to the original position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-shrugs';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Shrugs/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Shrugs/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cable Wrist Curl', 'cable-wrist-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Start out by placing a flat bench in front of a low pulley cable that has a straight bar attachment.', 'Use your arms to grab the cable bar with a narrow to shoulder width supinated grip (palms up) and bring them up so that your forearms are resting against the top of your thighs. Your wrists should be hanging just beyond your knees.', 'Start out by curling your wrist upwards and exhaling. Keep the contraction for a second.', 'Slowly lower your wrists back down to the starting position while inhaling.', 'Your forearms should be stationary as your wrist is the only movement needed to perform this exercise.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cable-wrist-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Wrist_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cable_Wrist_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Calf Press', 'calf-press', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Adjust the seat so that your legs are only slightly bent in the start position. The balls of your feet should be firmly on the platform.', 'Select an appropriate weight, and grasp the handles. This will be your starting position.', 'Straighten the legs by extending the knees, just barely lifting the weight from the stack. Your ankle should be fully flexed, toes pointing up. Execute the movement by pressing downward through the balls of your feet as far as possible.', 'After a brief pause, reverse the motion and repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'calf-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Machine' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Calf Press On The Leg Press Machine', 'calf-press-on-the-leg-press-machine', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Using a leg press machine, sit down on the machine and place your legs on the platform directly in front of you at a medium (shoulder width) foot stance.', 'Lower the safety bars holding the weighted platform in place and press the platform all the way up until your legs are fully extended in front of you without locking your knees. (Note: In some leg press units you can leave the safety bars on for increased safety. If your leg press unit allows for this, then this is the preferred method of performing the exercise.) Your torso and the legs should make perfect 90-degree angle. Now carefully place your toes and balls of your feet on the lower portion of the platform with the heels extending off. Toes should be facing forward, outwards or inwards as described at the beginning of the chapter. This will be your starting position.', 'Press on the platform by raising your heels as you breathe out by extending your ankles as high as possible and flexing your calf. Ensure that the knee is kept stationary at all times. There should be no bending at any time. Hold the contracted position by a second before you start to go back down.', 'Go back slowly to the starting position as you breathe in by lowering your heels as you bend the ankles until calves are stretched.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'calf-press-on-the-leg-press-machine';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Machine' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Press_On_The_Leg_Press_Machine/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Press_On_The_Leg_Press_Machine/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Calf Raise On A Dumbbell', 'calf-raise-on-a-dumbbell', NULL, v_category_id, 'strength', 'isolation', 'push', 'intermediate', ARRAY['Hang on to a sturdy object for balance and stand on a dumbbell handle, preferably one with round plates so that it rolls as in this manner you have to work harder to stabilize yourself; thus increasing the effectiveness of the exercise.', 'Now roll your foot slightly forward so that you can get a nice stretch of the calf. This will be your starting position.', 'Lift the calf as you roll your foot over the top of the handle so that you get a full extension. Exhale during the execution of this movement. Contract the calf hard at the top and hold for a second. Tip: As you come up, roll the dumbbell slightly backward.', 'Now inhale as you roll the dumbbell slightly forward as you come down to get a better stretch.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'calf-raise-on-a-dumbbell';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Raise_On_A_Dumbbell/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Raise_On_A_Dumbbell/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Calf Raises - With Bands', 'calf-raises-with-bands', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Grab an exercise band and stand on it with your toes making sure that the length of the band between the foot and the arms is the same for both sides.', 'While holding the handles of the band, raise the arms to the side of your head as if you were getting ready to perform a shoulder press. The palms should be facing forward with the elbows bent and to the sides. This movement will create tension on the band. This will be your starting position.', 'Keeping the hands by your shoulder, stand up on your toes as you exhale and contract the calves hard at the top of the movement.', 'After a one second contraction, slowly go back down to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'calf-raises-with-bands';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Resistance Band' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Raises_-_With_Bands/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Raises_-_With_Bands/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Calf-Machine Shoulder Shrug', 'calf-machine-shoulder-shrug', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Position yourself on the calf machine so that the shoulder pads are above your shoulders. Your torso should be straight with the arms extended normally by your side. This will be your starting position.', 'Raise your shoulders up towards your ears as you exhale and hold the contraction for a full second.', 'Slowly return to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'calf-machine-shoulder-shrug';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Machine' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf-Machine_Shoulder_Shrug/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf-Machine_Shoulder_Shrug/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Car Drivers', 'car-drivers', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['While standing upright, hold a barbell plate in both hands at the 3 and 9 o''clock positions. Your palms should be facing each other and your arms should be extended straight out in front of you. This will be your starting position.', 'Initiate the movement by rotating the plate as far to one side as possible. Use the same type of movement you would use to turn a steering wheel to one side.', 'Reverse the motion, turning it all the way to the opposite side.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'car-drivers';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Car_Drivers/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Car_Drivers/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chair Squat', 'chair-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['To begin, first set the bar to a position that best matches your height. Once the bar is loaded, step under it and position it across the back of your shoulders.', 'Take the bar with your hands facing forward, unlock it and lift it off the rack by extending your legs.', 'Move your feet forward about 18 inches in front of the bar. Position your legs using a shoulder width stance with the toes slightly pointed out. Look forward at all times and maintain a neutral or slightly arched spine. This will be your starting position.', 'Slowly lower the bar by bending the knees as you maintain a straight posture with the head up. Continue down until the angle between the upper and lower leg breaks 90 degrees.', 'Begin to raise the bar as you exhale by pushing the floor with the heels of your feet, extending the knees and returning to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chair-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Machine' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chair_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chair_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chin-Up', 'chin-up', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Grab the pull-up bar with the palms facing your torso and a grip closer than the shoulder width.', 'As you have both arms extended in front of you holding the bar at the chosen grip width, keep your torso as straight as possible while creating a curvature on your lower back and sticking your chest out. This is your starting position. Tip: Keeping the torso as straight as possible maximizes biceps stimulation while minimizing back involvement.', 'As you breathe out, pull your torso up until your head is around the level of the pull-up bar. Concentrate on using the biceps muscles in order to perform the movement. Keep the elbows close to your body. Tip: The upper torso should remain stationary as it moves through space and only the arms should move. The forearms should do no other work other than hold the bar.', 'After a second of squeezing the biceps in the contracted position, slowly lower your torso back to the starting position; when your arms are fully extended. Breathe in as you perform this portion of the movement.', 'Repeat this motion for the prescribed amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chin-up';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chin-Up/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chin-Up/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Clean and Press', 'clean-and-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Assume a shoulder-width stance, with knees inside the arms. Now while keeping the back flat, bend at the knees and hips so that you can grab the bar with the arms fully extended and a pronated grip that is slightly wider than shoulder width. Point the elbows out to sides. The bar should be close to the shins. Position the shoulders over or slightly ahead of the bar. Establish a flat back posture. This will be your starting position.', 'Begin to pull the bar by extending the knees. Move your hips forward and raise the shoulders at the same rate while keeping the angle of the back constant; continue to lift the bar straight up while keeping it close to your body.', 'As the bar passes the knee, extend at the ankles, knees, and hips forcefully, similar to a jumping motion. As you do so, continue to guide the bar with your hands, shrugging your shoulders and using the momentum from your movement to pull the bar as high as possible. The bar should travel close to your body, and you should keep your elbows out.', 'At maximum elevation, your feet should clear the floor and you should start to pull yourself under the bar. The mechanics of this could change slightly, depending on the weight used. You should descend into a squatting position as you pull yourself under the bar.', 'As the bar hits terminal height, rotate your elbows around and under the bar. Rack the bar across the front of the shoulders while keeping the torso erect and flexing the hips and knees to absorb the weight of the bar.', 'Stand to full height, holding the bar in the clean position.', 'Without moving your feet, press the bar overhead as you exhale. Lower the bar under control .']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'clean-and-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_and_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_and_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Clock Push-Up', 'clock-push-up', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Move into a prone position on the floor, supporting your weight on your hands and toes.', 'Your arms should be fully extended with the hands around shoulder width. Keep your body straight throughout the movement. This will be your starting position.', 'Descend by flexing at the elbow, lowering your chest toward the ground.', 'At the bottom, reverse the motion by pushing yourself up through elbow extension as quickly as possible until you are air borne. Aim to "jump" 12-18 inches to one side.', 'As you accelerate up, move your outside foot away from your direction of travel. Leaving the ground, shift your body about 30 degrees for the next repetition.', 'Return to the starting position and repeat the exercise, working all the way around until you are back where you started.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'clock-push-up';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clock_Push-Up/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clock_Push-Up/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Close-Grip Barbell Bench Press', 'close-grip-barbell-bench-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Lie back on a flat bench. Using a close grip (around shoulder width), lift the bar from the rack and hold it straight over you with your arms locked. This will be your starting position.', 'As you breathe in, come down slowly until you feel the bar on your middle chest. Tip: Make sure that - as opposed to a regular bench press - you keep the elbows close to the torso at all times in order to maximize triceps involvement.', 'After a second pause, bring the bar back to the starting position as you breathe out and push the bar using your triceps muscles. Lock your arms in the contracted position, hold for a second and then start coming down slowly again. Tip: It should take at least twice as long to go down than to come up.', 'Repeat the movement for the prescribed amount of repetitions.', 'When you are done, place the bar back in the rack.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'close-grip-barbell-bench-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_Barbell_Bench_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_Barbell_Bench_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Close-Grip Dumbbell Press', 'close-grip-dumbbell-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Place a dumbbell standing up on a flat bench.', 'Ensuring that the dumbbell stays securely placed at the top of the bench, lie perpendicular to the bench with only your shoulders lying on the surface. Hips should be below the bench and your legs bent with your feet firmly on the floor.', 'Grasp the dumbbell with both hands and hold it straight over your chest at arm''s length. Both palms should be pressing against the underside of the sides of the dumbbell. This will be your starting position.', 'Initiate the movement by lowering the dumbbell to your chest.', 'Return to the starting position by extending the elbows.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'close-grip-dumbbell-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_Dumbbell_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_Dumbbell_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Close-Grip EZ Bar Curl', 'close-grip-ez-bar-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up with your torso upright while holding an E-Z Curl Bar at the closer inner handle. The palm of your hands should be facing forward and they should be slightly tilted inwards due to the shape of the bar. The elbows should be close to the torso. This will be your starting position.', 'While holding the upper arms stationary, curl the weights forward while contracting the biceps as you breathe out. Tip: Only the forearms should move.', 'Continue the movement until your biceps are fully contracted and the bar is at shoulder level. Hold the contracted position for a second and squeeze the biceps hard.', 'Slowly begin to bring the bar back to starting position as your breathe in.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'close-grip-ez-bar-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_EZ_Bar_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_EZ_Bar_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Close-Grip EZ-Bar Curl with Band', 'close-grip-ez-bar-curl-with-band', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Attach a band to each end of the bar. Take the bar, placing a foot on the middle of the band. Stand upright with a narrow, supinated grip on the EZ bar. The elbows should be close to the torso. This will be your starting position.', 'While keeping the upper arms in place, flex the elbows to execute the curl. Exhale as the weight is lifted.', 'Continue the movement until your biceps are fully contracted and the bar is at shoulder level. Hold the contracted position for a second and squeeze the biceps hard.', 'Slowly begin to bring the bar back to starting position as your breathe in.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'close-grip-ez-bar-curl-with-band';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'EZ Curl Bar' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_EZ-Bar_Curl_with_Band/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_EZ-Bar_Curl_with_Band/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Close-Grip EZ-Bar Press', 'close-grip-ez-bar-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Lie on a flat bench with an EZ bar loaded to an appropriate weight.', 'Using a narrow grip lift the bar and hold it straight over your torso with your elbows in. The arms should be perpendicular to the floor. This will be your starting position.', 'Now lower the bar down to your lower chest as you breathe in. Keep the elbows in as you perform this movement.', 'Using the triceps to push the bar back up, press it back to the starting position by extending the elbows as you exhale.', 'Repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'close-grip-ez-bar-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'EZ Curl Bar' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_EZ-Bar_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_EZ-Bar_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Close-Grip Front Lat Pulldown', 'close-grip-front-lat-pulldown', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Sit down on a pull-down machine with a wide bar attached to the top pulley. Make sure that you adjust the knee pad of the machine to fit your height. These pads will prevent your body from being raised by the resistance attached to the bar.', 'Grab the bar with the palms facing forward using the prescribed grip. Note on grips: For a wide grip, your hands need to be spaced out at a distance wider than your shoulder width. For a medium grip, your hands need to be spaced out at a distance equal to your shoulder width and for a close grip at a distance smaller than your shoulder width.', 'As you have both arms extended in front of you - while holding the bar at the chosen grip width - bring your torso back around 30 degrees or so while creating a curvature on your lower back and sticking your chest out. This is your starting position.', 'As you breathe out, bring the bar down until it touches your upper chest by drawing the shoulders and the upper arms down and back. Tip: Concentrate on squeezing the back muscles once you reach the full contracted position. The upper torso should remain stationary (only the arms should move). The forearms should do no other work except for holding the bar; therefore do not try to pull the bar down using the forearms.', 'After a second in the contracted position, while squeezing your shoulder blades together, slowly raise the bar back to the starting position when your arms are fully extended and the lats are fully stretched. Inhale during this portion of the movement.', '6. Repeat this motion for the prescribed amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'close-grip-front-lat-pulldown';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_Front_Lat_Pulldown/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_Front_Lat_Pulldown/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Close-Grip Push-Up off of a Dumbbell', 'close-grip-push-up-off-of-a-dumbbell', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Lie on the floor and place your hands on an upright dumbbell. Supporting your weight on your toes and hands, keep your torso rigid and your elbows in with your arms straight. This will be your starting position.', 'Lower your body, allowing the elbows to flex while you inhale. Keep your body straight, not allowing your hips to rise or sag.', 'Press yourself back up to the starting position by extending the elbows. Breathe out as you perform this step.', 'After a pause at the contracted position, repeat the movement for the prescribed amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'close-grip-push-up-off-of-a-dumbbell';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_Push-Up_off_of_a_Dumbbell/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_Push-Up_off_of_a_Dumbbell/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Close-Grip Standing Barbell Curl', 'close-grip-standing-barbell-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Hold a barbell with both hands, palms up and a few inches apart.', 'Stand with your torso straight and your head up. Your feet should be about shoulder width and your elbows close to your torso. This will be your starting position. Tip: You will keep your upper arms and elbows stationary throughout the movement.', 'Curl the bar up in a semicircular motion until the forearms touch your biceps. Exhale as you perform this portion of the movement and contract your biceps hard for a second at the top. Tip: Avoid bending the back or using swinging motions as you lift the weight. Only the forearms should move.', 'Slowly go back down to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'close-grip-standing-barbell-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_Standing_Barbell_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Close-Grip_Standing_Barbell_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cocoons', 'cocoons', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Begin by lying on your back on the ground. Your legs should be straight and your arms extended behind your head. This will be your starting position.', 'To perform the movement, tuck the knees toward your chest, rotating your pelvis to lift your glutes from the floor. As you do so, flex the spine, bringing your arms back over your head to perform a simultaneous crunch motion.', 'After a brief pause, return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cocoons';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cocoons/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cocoons/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Concentration Curls', 'concentration-curls', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Sit down on a flat bench with one dumbbell in front of you between your legs. Your legs should be spread with your knees bent and feet on the floor.', 'Use your right arm to pick the dumbbell up. Place the back of your right upper arm on the top of your inner right thigh. Rotate the palm of your hand until it is facing forward away from your thigh. Tip: Your arm should be extended and the dumbbell should be above the floor. This will be your starting position.', 'While holding the upper arm stationary, curl the weights forward while contracting the biceps as you breathe out. Only the forearms should move. Continue the movement until your biceps are fully contracted and the dumbbells are at shoulder level. Tip: At the top of the movement make sure that the little finger of your arm is higher than your thumb. This guarantees a good contraction. Hold the contracted position for a second as you squeeze the biceps.', 'Slowly begin to bring the dumbbells back to starting position as your breathe in. Caution: Avoid swinging motions at any time.', 'Repeat for the recommended amount of repetitions. Then repeat the movement with the left arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'concentration-curls';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Concentration_Curls/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Concentration_Curls/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cross Body Hammer Curl', 'cross-body-hammer-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up straight with a dumbbell in each hand. Your hands should be down at your side with your palms facing in.', 'While keeping your palms facing in and without twisting your arm, curl the dumbbell of the right arm up towards your left shoulder as you exhale. Touch the top of the dumbbell to your shoulder and hold the contraction for a second.', 'Slowly lower the dumbbell along the same path as you inhale and then repeat the same movement for the left arm.', 'Continue alternating in this fashion until the recommended amount of repetitions is performed for each arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cross-body-hammer-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cross_Body_Hammer_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cross_Body_Hammer_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cross Over - With Bands', 'cross-over-with-bands', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Secure an exercise band around a stationary post.', 'While facing away from the post, grab the handles on both ends of the band and step forward enough to create tension on the band.', 'Raise your arms to the sides, parallel to the floor, perpendicular to your torso (your torso and the arms should resemble the letter "T") and with the palms facing forward. Have them extended with a slight bend at the elbows. This will be your starting position.', 'While keeping your arms straight, bring them across your chest in a semicircular motion to the front as you exhale and flex your pecs. Hold the contraction for a second.', 'Slowly return to the starting position as you inhale.', 'Perform for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cross-over-with-bands';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Resistance Band' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cross_Over_-_With_Bands/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cross_Over_-_With_Bands/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cross-Body Crunch', 'cross-body-crunch', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Lie flat on your back and bend your knees about 60 degrees.', 'Keep your feet flat on the floor and place your hands loosely behind your head. This will be your starting position.', 'Now curl up and bring your right elbow and shoulder across your body while bring your left knee in toward your left shoulder at the same time. Reach with your elbow and try to touch your knee. Exhale as you perform this movement. Tip: Try to bring your shoulder up towards your knee rather than just your elbow and remember that the key is to contract the abs as you perform the movement; not just to move the elbow.', 'Now go back down to the starting position as you inhale and repeat with the left elbow and the right knee.', 'Continue alternating in this manner until all prescribed repetitions are done.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cross-body-crunch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cross-Body_Crunch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cross-Body_Crunch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Crunch - Hands Overhead', 'crunch-hands-overhead', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Lie on the floor with your back flat and knees bent with around a 60-degree angle between the hamstrings and the calves.', 'Keep your feet flat on the floor and stretch your arms overhead with your palms crossed. This will be your starting position.', 'Curl your upper body forward and bring your shoulder blades just off the floor. At all times, keep your arms aligned with your head, neck and shoulder. Don''t move them forward from that position. Exhale as you perform this portion of the movement and hold the contraction for a second.', 'Slowly lower down to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'crunch-hands-overhead';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Crunch_-_Hands_Overhead/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Crunch_-_Hands_Overhead/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Crunch - Legs On Exercise Ball', 'crunch-legs-on-exercise-ball', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Lie flat on your back with your feet resting on an exercise ball and your knees bent at a 90 degree angle.', 'Place your feet three to four inches apart and point your toes inward so they touch.', 'Place your hands lightly on either side of your head keeping your elbows in. Tip: Don''t lock your fingers behind your head.', 'Push the small of your back down in the floor in order to better isolate your abdominal muscles. This will be your starting position.', 'Begin to roll your shoulders off the floor and continue to push down as hard as you can with your lower back. Your shoulders should come up off the floor only about four inches, and your lower back should remain on the floor. Breathe out as you execute this portion of the movement. Squeeze your abdominals hard at the top of the contraction and hold for a second. Tip: Focus on a slow, controlled movement. Refrain from using momentum at any time.', 'Slowly go back down to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'crunch-legs-on-exercise-ball';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Crunch_-_Legs_On_Exercise_Ball/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Crunch_-_Legs_On_Exercise_Ball/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Crunches', 'crunches', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Lie flat on your back with your feet flat on the ground, or resting on a bench with your knees bent at a 90 degree angle. If you are resting your feet on a bench, place them three to four inches apart and point your toes inward so they touch.', 'Now place your hands lightly on either side of your head keeping your elbows in. Tip: Don''t lock your fingers behind your head.', 'While pushing the small of your back down in the floor to better isolate your abdominal muscles, begin to roll your shoulders off the floor.', 'Continue to push down as hard as you can with your lower back as you contract your abdominals and exhale. Your shoulders should come up off the floor only about four inches, and your lower back should remain on the floor. At the top of the movement, contract your abdominals hard and keep the contraction for a second. Tip: Focus on slow, controlled movement - don''t cheat yourself by using momentum.', 'After the one second contraction, begin to come down slowly again to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'crunches';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Crunches/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Crunches/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Cuban Press', 'cuban-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Take a dumbbell in each hand with a pronated grip in a standing position. Raise your upper arms so that they are parallel to the floor, allowing your lower arms to hang in the "scarecrow" position. This will be your starting position.', 'To initiate the movement, externally rotate the shoulders to move the upper arm 180 degrees. Keep the upper arms in place, rotating the upper arms until the wrists are directly above the elbows, the forearms perpendicular to the floor.', 'Now press the dumbbells by extending at the elbows, straightening your arms overhead.', 'Return to the starting position as you breathe in by reversing the steps.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'cuban-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cuban_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Cuban_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dead Bug', 'dead-bug', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Begin lying on your back with your hands extended above you toward the ceiling.', 'Bring your feet, knees, and hips up to 90 degrees.', 'Exhale hard to bring your ribcage down and flatten your back onto the floor, rotating your pelvis up and squeezing your glutes. Hold this position throughout the movement. This will be your starting position.', 'Initiate the exercise by extending one leg, straightening the knee and hip to bring the leg just above the ground.', 'Maintain the position of your lumbar and pelvis as you perform the movement, as your back is going to want to arch.', 'Stay tight and return the working leg to the starting position.', 'Repeat on the opposite side, alternating until the set is complete.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dead-bug';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dead_Bug/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dead_Bug/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Decline Barbell Bench Press', 'decline-barbell-bench-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Secure your legs at the end of the decline bench and slowly lay down on the bench.', 'Using a medium width grip (a grip that creates a 90-degree angle in the middle of the movement between the forearms and the upper arms), lift the bar from the rack and hold it straight over you with your arms locked. The arms should be perpendicular to the floor. This will be your starting position. Tip: In order to protect your rotator cuff, it is best if you have a spotter help you lift the barbell off the rack.', 'As you breathe in, come down slowly until you feel the bar on your lower chest.', 'After a second pause, bring the bar back to the starting position as you breathe out and push the bar using your chest muscles. Lock your arms and squeeze your chest in the contracted position, hold for a second and then start coming down slowly again. Tip: It should take at least twice as long to go down than to come up).', 'Repeat the movement for the prescribed amount of repetitions.', 'When you are done, place the bar back in the rack.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'decline-barbell-bench-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Barbell_Bench_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Barbell_Bench_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Decline Close-Grip Bench To Skull Crusher', 'decline-close-grip-bench-to-skull-crusher', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Secure your legs at the end of the decline bench and slowly lay down on the bench.', 'Using a close grip (a grip that is slightly less than shoulder width), lift the bar from the rack and hold it straight over you with your arms locked and elbows in. The arms should be perpendicular to the floor. This will be your starting position. Tip: In order to protect your rotator cuff, it is best if you have a spotter help you lift the barbell off the rack.', 'Now lower the bar down to your lower chest as you breathe in. Keep the elbows in as you perform this movement.', 'Using the triceps to push the bar back up, press it back to the starting position as you exhale.', 'As you breathe in and you keep the upper arms stationary, bring the bar down slowly by moving your forearms in a semicircular motion towards you until you feel the bar slightly touch your forehead. Breathe in as you perform this portion of the movement.', 'Lift the bar back to the starting position by contracting the triceps and exhaling.', 'Repeat steps 3-6 until the recommended amount of repetitions is performed.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'decline-close-grip-bench-to-skull-crusher';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Close-Grip_Bench_To_Skull_Crusher/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Close-Grip_Bench_To_Skull_Crusher/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Decline Crunch', 'decline-crunch', NULL, v_category_id, 'strength', 'isolation', 'pull', 'intermediate', ARRAY['Secure your legs at the end of the decline bench and lie down.', 'Now place your hands lightly on either side of your head keeping your elbows in. Tip: Don''t lock your fingers behind your head.', 'While pushing the small of your back down in the bench to better isolate your abdominal muscles, begin to roll your shoulders off it.', 'Continue to push down as hard as you can with your lower back as you contract your abdominals and exhale. Your shoulders should come up off the bench only about four inches, and your lower back should remain on the bench. At the top of the movement, contract your abdominals hard and keep the contraction for a second. Tip: Focus on slow, controlled movement - don''t cheat yourself by using momentum.', 'After the one second contraction, begin to come down slowly again to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'decline-crunch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Crunch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Crunch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Decline Dumbbell Bench Press', 'decline-dumbbell-bench-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Secure your legs at the end of the decline bench and lie down with a dumbbell on each hand on top of your thighs. The palms of your hand will be facing each other.', 'Once you are laying down, move the dumbbells in front of you at shoulder width.', 'Once at shoulder width, rotate your wrists forward so that the palms of your hands are facing away from you. This will be your starting position.', 'Bring down the weights slowly to your side as you breathe out. Keep full control of the dumbbells at all times. Tip: Throughout the motion, the forearms should always be perpendicular to the floor.', 'As you breathe out, push the dumbbells up using your pectoral muscles. Lock your arms in the contracted position, squeeze your chest, hold for a second and then start coming down slowly. Tip: It should take at least twice as long to go down than to come up..', 'Repeat the movement for the prescribed amount of repetitions of your training program.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'decline-dumbbell-bench-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Dumbbell_Bench_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Dumbbell_Bench_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Decline Dumbbell Flyes', 'decline-dumbbell-flyes', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Secure your legs at the end of the decline bench and lie down with a dumbbell on each hand on top of your thighs. The palms of your hand will be facing each other.', 'Once you are laying down, move the dumbbells in front of you at shoulder width. The palms of the hands should be facing each other and the arms should be perpendicular to the floor and fully extended. This will be your starting position.', 'With a slight bend on your elbows in order to prevent stress at the biceps tendon, lower your arms out at both sides in a wide arc until you feel a stretch on your chest. Breathe in as you perform this portion of the movement. Tip: Keep in mind that throughout the movement, the arms should remain stationary; the movement should only occur at the shoulder joint.', 'Return your arms back to the starting position as you squeeze your chest muscles and breathe out. Tip: Make sure to use the same arc of motion used to lower the weights.', 'Hold for a second at the contracted position and repeat the movement for the prescribed amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'decline-dumbbell-flyes';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Dumbbell_Flyes/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Dumbbell_Flyes/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Decline Dumbbell Triceps Extension', 'decline-dumbbell-triceps-extension', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Secure your legs at the end of the decline bench and lie down with a dumbbell on each hand on top of your thighs. The palms of your hand will be facing each other.', 'Once you are laying down, move the dumbbells in front of you at shoulder width. The palms of the hands should be facing each other and the arms should be perpendicular to the floor and fully extended. This will be your starting position.', 'As you breathe in and you keep the upper arms stationary (and elbows in), bring the dumbbells down slowly by moving your forearms in a semicircular motion towards you until your thumbs are next to your ears. Breathe in as you perform this portion of the movement.', 'Lift the dumbbells back to the starting position by contracting the triceps and exhaling.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'decline-dumbbell-triceps-extension';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Dumbbell_Triceps_Extension/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Dumbbell_Triceps_Extension/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Decline EZ Bar Triceps Extension', 'decline-ez-bar-triceps-extension', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Secure your legs at the end of the decline bench and slowly lay down on the bench.', 'Using a close grip (a grip that is slightly less than shoulder width), lift the EZ bar from the rack and hold it straight over you with your arms locked and elbows in. The arms should be perpendicular to the floor. This will be your starting position. Tip: In order to protect your rotator cuff, it is best if you have a spotter help you lift the barbell off the rack.', 'As you breathe in and you keep the upper arms stationary, bring the bar down slowly by moving your forearms in a semicircular motion towards you until you feel the bar slightly touch your forehead. Breathe in as you perform this portion of the movement.', 'Lift the bar back to the starting position by contracting the triceps and exhaling.', 'Repeat until the recommended amount of repetitions is performed.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'decline-ez-bar-triceps-extension';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_EZ_Bar_Triceps_Extension/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_EZ_Bar_Triceps_Extension/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Decline Oblique Crunch', 'decline-oblique-crunch', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Secure your legs at the end of the decline bench and slowly lay down on the bench.', 'Raise your upper body off the bench until your torso is about 35-45 degrees if measured from the floor.', 'Put one hand beside your head and the other on your thigh. This will be your starting position.', 'Raise your upper body slowly from the starting position while turning your torso to the left. Continue crunching up as you exhale until your right elbow touches your left knee. Hold this contracted position for a second. Tip: Focus on keeping your abs tight and keeping the movement slow and controlled.', 'Lower your body back down slowly to the starting position as you inhale.', 'After completing one set on the right for the recommended amount of repetitions, switch to your left side. Tip: Focus on really twisting your torso and feeling the contraction when you are in the up position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'decline-oblique-crunch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Oblique_Crunch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Oblique_Crunch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Decline Push-Up', 'decline-push-up', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Lie on the floor face down and place your hands about 36 inches apart while holding your torso up at arms length. Move your feet up to a box or bench. This will be your starting position.', 'Next, lower yourself downward until your chest almost touches the floor as you inhale.', 'Now breathe out and press your upper body back up to the starting position while squeezing your chest.', 'After a brief pause at the top contracted position, you can begin to lower yourself downward again for as many repetitions as needed.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'decline-push-up';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Push-Up/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Push-Up/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Decline Reverse Crunch', 'decline-reverse-crunch', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Lie on your back on a decline bench and hold on to the top of the bench with both hands. Don''t let your body slip down from this position.', 'Hold your legs parallel to the floor using your abs to hold them there while keeping your knees and feet together. Tip: Your legs should be fully extended with a slight bend on the knee. This will be your starting position.', 'While exhaling, move your legs towards the torso as you roll your pelvis backwards and you raise your hips off the bench. At the end of this movement your knees will be touching your chest.', 'Hold the contraction for a second and move your legs back to the starting position while inhaling.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'decline-reverse-crunch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Reverse_Crunch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Reverse_Crunch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Decline Smith Press', 'decline-smith-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Place a decline bench underneath the Smith machine. Now place the barbell at a height that you can reach when lying down and your arms are almost fully extended. Using a pronated grip that is wider than shoulder width, unlock the bar from the rack and hold it straight over you with your arms extended. This will be your starting position.', 'As you inhale, lower the bar under control by allowing the elbows to flex, lightly contacting the torso.', 'After a brief pause, bring the bar back to the starting position by extending the elbows, exhaling as you do so.', 'Repeat the movement for the prescribed amount of repetitions.', 'When the set is complete, lock the bar back in the rack.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'decline-smith-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Machine' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Smith_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Decline_Smith_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dip Machine', 'dip-machine', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Sit securely in a dip machine, select the weight and firmly grasp the handles.', 'Now keep your elbows in at your sides in order to place emphasis on the triceps. The elbows should be bent at a 90 degree angle.', 'As you contract the triceps, extend your arms downwards as you exhale. Tip: At the bottom of the movement, focus on keeping a little bend in your arms to keep tension on the triceps muscle.', 'Now slowly let your arms come back up to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dip-machine';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Machine' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dip_Machine/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dip_Machine/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dips - Chest Version', 'dips-chest-version', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['For this exercise you will need access to parallel bars. To get yourself into the starting position, hold your body at arms length (arms locked) above the bars.', 'While breathing in, lower yourself slowly with your torso leaning forward around 30 degrees or so and your elbows flared out slightly until you feel a slight stretch in the chest.', 'Once you feel the stretch, use your chest to bring your body back to the starting position as you breathe out. Tip: Remember to squeeze the chest at the top of the movement for a second.', 'Repeat the movement for the prescribed amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dips-chest-version';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dips_-_Chest_Version/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dips_-_Chest_Version/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dips - Triceps Version', 'dips-triceps-version', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['To get into the starting position, hold your body at arm''s length with your arms nearly locked above the bars.', 'Now, inhale and slowly lower yourself downward. Your torso should remain upright and your elbows should stay close to your body. This helps to better focus on tricep involvement. Lower yourself until there is a 90 degree angle formed between the upper arm and forearm.', 'Then, exhale and push your torso back up using your triceps to bring your body back to the starting position.', 'Repeat the movement for the prescribed amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dips-triceps-version';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dips_-_Triceps_Version/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dips_-_Triceps_Version/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Donkey Calf Raises', 'donkey-calf-raises', NULL, v_category_id, 'strength', 'isolation', 'push', 'intermediate', ARRAY['For this exercise you will need access to a donkey calf raise machine. Start by positioning your lower back and hips under the padded lever provided. The tailbone area should be the one making contact with the pad.', 'Place both of your arms on the side handles and place the balls of your feet on the calf block with the heels extending off. Align the toes forward, inward or outward, depending on the area you wish to target, and straighten the knees without locking them. This will be your starting position.', 'Raise your heels as you breathe out by extending your ankles as high as possible and flexing your calf. Ensure that the knee is kept stationary at all times. There should be no bending at any time. Hold the contracted position by a second before you start to go back down.', 'Go back slowly to the starting position as you breathe in by lowering your heels as you bend the ankles until calves are stretched.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'donkey-calf-raises';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Donkey_Calf_Raises/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Donkey_Calf_Raises/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Double Kettlebell Alternating Hang Clean', 'double-kettlebell-alternating-hang-clean', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Place two kettlebells between your feet. To get in the starting position, push your butt back and look straight ahead.', 'Clean one kettlebell to your shoulder and hold on to the other kettlebell.', 'With a fluid motion, lower the top kettlebell while driving the bottom kettlebell up.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'double-kettlebell-alternating-hang-clean';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Double_Kettlebell_Alternating_Hang_Clean/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Double_Kettlebell_Alternating_Hang_Clean/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Double Kettlebell Jerk', 'double-kettlebell-jerk', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Hold a kettlebell by the handle in each hand.', 'Clean the kettlebells to your shoulders by extending through the legs and hips as you pull the kettlebells towards your shoulders. Rotate your wrists as you do so, so that the palms face forward. This will be your starting position.', 'Dip your body by bending the knees, keeping your torso upright.', 'Immediately reverse direction, driving through the heels, in essence jumping to create momentum.', 'As you do so, press the kettlebells overhead to lockout by extending the arms, using your body''s momentum to move the weights.', 'Return your feet to the ground in a split fashion, with one foot forward and one foot back.', 'Keeping the weights overhead, return to a standing position, bringing your feet together. Lower the weights to perform the next repetition.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'double-kettlebell-jerk';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Double_Kettlebell_Jerk/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Double_Kettlebell_Jerk/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Double Kettlebell Push Press', 'double-kettlebell-push-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Clean two kettlebells to your shoulders.', 'Squat down a few inches and reverse the motion rapidly. Use the momentum from the legs to drive the kettlebells overhead.', 'Once the kettlebells are locked out, lower the kettlebells to your shoulders and repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'double-kettlebell-push-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Double_Kettlebell_Push_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Double_Kettlebell_Push_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Double Kettlebell Snatch', 'double-kettlebell-snatch', NULL, v_category_id, 'strength', 'compound', 'pull', 'advanced', ARRAY['Place two kettlebells behind your feet. Bend your knees and sit back to pick up the kettlebells.', 'Swing the kettlebells between your legs forcefully and reverse the direction.', 'Drive through with your hips and lock the ketttlebells overhead in one uninterrupted motion.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'double-kettlebell-snatch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Double_Kettlebell_Snatch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Double_Kettlebell_Snatch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Downward Facing Balance', 'downward-facing-balance', NULL, v_category_id, 'strength', 'isolation', 'static', 'intermediate', ARRAY['Lie facedown on top of an exercise ball.', 'While resting on your stomach on the ball, walk your hands forward along the floor and lift your legs, extending your elbows and knees.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'downward-facing-balance';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Exercise Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Downward_Facing_Balance/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Downward_Facing_Balance/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Drag Curl', 'drag-curl', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Grab a barbell with a supinated grip (palms facing forward) and get your elbows close to your torso and back. This will be your starting position.', 'As you exhale, curl the bar up while keeping the elbows to the back as you "Drag" the bar up by keeping it in contact with your torso. Tip: As you can see, you will not be keeping the elbows pinned to your sides, but instead you will be bringing them back. Also, do not lift your shoulders.', 'Slowly go back to the starting position as you keep the bar in contact with the torso at all times.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'drag-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Drag_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Drag_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Alternate Bicep Curl', 'dumbbell-alternate-bicep-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand (torso upright) with a dumbbell in each hand held at arms length. The elbows should be close to the torso and the palms of your hand should be facing your thighs.', 'While holding the upper arm stationary, curl the right weight as you rotate the palm of the hands until they are facing forward. At this point continue contracting the biceps as you breathe out until your biceps is fully contracted and the dumbbells are at shoulder level. Hold the contracted position for a second as you squeeze the biceps. Tip: Only the forearms should move.', 'Slowly begin to bring the dumbbell back to the starting position as your breathe in. Tip: Remember to twist the palms back to the starting position (facing your thighs) as you come down.', 'Repeat the movement with the left hand. This equals one repetition.', 'Continue alternating in this manner for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-alternate-bicep-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Alternate_Bicep_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Alternate_Bicep_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Bench Press', 'dumbbell-bench-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Lie down on a flat bench with a dumbbell in each hand resting on top of your thighs. The palms of your hands will be facing each other.', 'Then, using your thighs to help raise the dumbbells up, lift the dumbbells one at a time so that you can hold them in front of you at shoulder width.', 'Once at shoulder width, rotate your wrists forward so that the palms of your hands are facing away from you. The dumbbells should be just to the sides of your chest, with your upper arm and forearm creating a 90 degree angle. Be sure to maintain full control of the dumbbells at all times. This will be your starting position.', 'Then, as you breathe out, use your chest to push the dumbbells up. Lock your arms at the top of the lift and squeeze your chest, hold for a second and then begin coming down slowly. Tip: Ideally, lowering the weight should take about twice as long as raising it.', 'Repeat the movement for the prescribed amount of repetitions of your training program.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-bench-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Bench_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Bench_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Bench Press with Neutral Grip', 'dumbbell-bench-press-with-neutral-grip', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Take a dumbbell in each hand and lay back onto a flat bench. Your feet should be flat on the floor and your shoulder blades retracted.', 'Maintaining a neutral grip, palms facing each other, begin with your arms extended directly above you, perpendicular to the floor. This will be your starting position.', 'Begin the movement by flexing the elbow, lowering the upper arms to the side. Descend until the dumbbells are to your torso.', 'Pause, then extend the elbow and return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-bench-press-with-neutral-grip';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Bench_Press_with_Neutral_Grip/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Bench_Press_with_Neutral_Grip/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Bicep Curl', 'dumbbell-bicep-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up straight with a dumbbell in each hand at arm''s length. Keep your elbows close to your torso and rotate the palms of your hands until they are facing forward. This will be your starting position.', 'Now, keeping the upper arms stationary, exhale and curl the weights while contracting your biceps. Continue to raise the weights until your biceps are fully contracted and the dumbbells are at shoulder level. Hold the contracted position for a brief pause as you squeeze your biceps.', 'Then, inhale and slowly begin to lower the dumbbells back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-bicep-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Bicep_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Bicep_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Clean', 'dumbbell-clean', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Begin standing with a dumbbell in each hand with your feet shoulder width apart.', 'Lower the weights to the floor by flexing at the hips and knees, pushing your hips back until the dumbbells reach the floor. This will be your starting position.', 'To initiate the movement, violently jump upward by extending the hips, knees, and ankles to acclerate the weights upward. Maintaining a neutral grip on the dumbbells, keep the arms straight until full extension is reached.', 'After full extension, rebend the hips and knees to receive the weight in a squat position. Allow the arms to bend, guiding the dumbbells to your shoulders.', 'Upon receiving the weight in the squat position, extend the hips and knees to finish in a standing position with the weights on your shoulders.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-clean';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Clean/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Clean/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Flyes', 'dumbbell-flyes', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Lie down on a flat bench with a dumbbell on each hand resting on top of your thighs. The palms of your hand will be facing each other.', 'Then using your thighs to help raise the dumbbells, lift the dumbbells one at a time so you can hold them in front of you at shoulder width with the palms of your hands facing each other. Raise the dumbbells up like you''re pressing them, but stop and hold just before you lock out. This will be your starting position.', 'With a slight bend on your elbows in order to prevent stress at the biceps tendon, lower your arms out at both sides in a wide arc until you feel a stretch on your chest. Breathe in as you perform this portion of the movement. Tip: Keep in mind that throughout the movement, the arms should remain stationary; the movement should only occur at the shoulder joint.', 'Return your arms back to the starting position as you squeeze your chest muscles and breathe out. Tip: Make sure to use the same arc of motion used to lower the weights.', 'Hold for a second at the contracted position and repeat the movement for the prescribed amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-flyes';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Flyes/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Flyes/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Incline Row', 'dumbbell-incline-row', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Using a neutral grip, lean into an incline bench.', 'Take a dumbbell in each hand with a neutral grip, beginning with the arms straight. This will be your starting position.', 'Retract the shoulder blades and flex the elbows to row the dumbbells to your side.', 'Pause at the top of the motion, and then return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-incline-row';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Incline_Row/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Incline_Row/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Incline Shoulder Raise', 'dumbbell-incline-shoulder-raise', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Sit on an Incline Bench while holding a dumbbell on each hand on top of your thighs.', 'Lift your legs up to kick the weights to your shoulders and lean back. Position the dumbbells above your shoulders with your arms extended. The arms should be perpendicular to the floor with your palms facing forward and knuckles pointing towards the ceiling. This will be your starting position.', 'While keeping the arms straight and locked, lift the dumbbells by raising the shoulders from the bench as you breathe out.', 'Bring back the dumbbells to the starting position as you breathe in.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-incline-shoulder-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Incline_Shoulder_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Incline_Shoulder_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Lunges', 'dumbbell-lunges', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Stand with your torso upright holding two dumbbells in your hands by your sides. This will be your starting position.', 'Step forward with your right leg around 2 feet or so from the foot being left stationary behind and lower your upper body down, while keeping the torso upright and maintaining balance. Inhale as you go down. Note: As in the other exercises, do not allow your knee to go forward beyond your toes as you come down, as this will put undue stress on the knee joint. Make sure that you keep your front shin perpendicular to the ground.', 'Using mainly the heel of your foot, push up and go back to the starting position as you exhale.', 'Repeat the movement for the recommended amount of repetitions and then perform with the left leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-lunges';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Lunges/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Lunges/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Lying One-Arm Rear Lateral Raise', 'dumbbell-lying-one-arm-rear-lateral-raise', NULL, v_category_id, 'strength', 'isolation', 'pull', 'intermediate', ARRAY['While holding a dumbbell in one hand, lay with your chest down on a slightly inclined (around 15 degrees when measured from the floor) adjustable bench. The other hand can be used to hold to the leg of the bench for stability.', 'Position the palm of the hand that is holding the dumbbell in a neutral manner (palms facing your torso) as you keep the arm extended with the elbow slightly bent. This will be your starting position.', 'Now raise the arm with the dumbbell to the side until your elbow is at shoulder height and your arm is roughly parallel to the floor as you exhale. Tip: Maintain your arm perpendicular to the torso while keeping your arm extended throughout the movement. Also, keep the contraction at the top for a second.', 'Slowly lower the dumbbell to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-lying-one-arm-rear-lateral-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Lying_One-Arm_Rear_Lateral_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Lying_One-Arm_Rear_Lateral_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Lying Pronation', 'dumbbell-lying-pronation', NULL, v_category_id, 'strength', 'isolation', 'pull', 'intermediate', ARRAY['Lie on a flat bench face down with one arm holding a dumbbell and the other hand on top of the bench folded so that you can rest your head on it.', 'Bend the elbows of the arm holding the dumbbell so that it creates a 90-degree angle between the upper arm and the forearm.', 'Now raise the upper arm so that the forearm is perpendicular to the floor and the upper arm is perpendicular to your torso. Tip: The upper arm should be parallel to the floor and also creating a 90-degree angle with your torso. This will be your starting position.', 'As you breathe out, externally rotate your forearm so that the dumbbell is lifted forward as you maintain the 90 degree angle bend between the upper arms and the forearm. You will continue this external rotation until the forearm is parallel to the floor. At this point you will hold the contraction for a second.', 'As you breathe in, slowly go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-lying-pronation';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Lying_Pronation/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Lying_Pronation/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Lying Rear Lateral Raise', 'dumbbell-lying-rear-lateral-raise', NULL, v_category_id, 'strength', 'isolation', 'pull', 'intermediate', ARRAY['While holding a dumbbell in each hand, lay with your chest down on a slightly inclined (around 15 degrees when measured from the floor) adjustable bench.', 'Position the palms of the hands in a neutral manner (palms facing your torso) as you keep the arms extended with the elbows slightly bent. This will be your starting position.', 'Now raise the arms to the side until your elbows are at shoulder height and your arms are roughly parallel to the floor as you exhale. Tip: Maintain your arms perpendicular to the torso while keeping them extended throughout the movement. Also, keep the contraction at the top for a second.', 'Slowly lower the dumbbells to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions and then switch to the other arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-lying-rear-lateral-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Lying_Rear_Lateral_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Lying_Rear_Lateral_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Lying Supination', 'dumbbell-lying-supination', NULL, v_category_id, 'strength', 'isolation', 'pull', 'intermediate', ARRAY['Lie sideways on a flat bench with one arm holding a dumbbell and the other hand on top of the bench folded so that you can rest your head on it.', 'Bend the elbows of the arm holding the dumbbell so that it creates a 90-degree angle between the upper arm and the forearm.', 'Now raise the upper arm so that the forearm is parallel to the floor and perpendicular to your torso (Tip: So the forearm will be directly in front of you). The upper arm will be stationary by your torso and should be parallel to the floor (aligned with your torso at all times). This will be your starting position.', 'As you breathe out, externally rotate your forearm so that the dumbbell is lifted up in a semicircle motion as you maintain the 90 degree angle bend between the upper arms and the forearm. You will continue this external rotation until the forearm is perpendicular to the floor and the torso pointing towards the ceiling. At this point you will hold the contraction for a second.', 'As you breathe in, slowly go back to the starting position.', 'Repeat for the recommended amount of repetitions and then switch to the other arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-lying-supination';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Lying_Supination/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Lying_Supination/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell One-Arm Shoulder Press', 'dumbbell-one-arm-shoulder-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Grab a dumbbell and either sit on a military press bench or a utility bench that has a back support on it as you place the dumbbells upright on top of your thighs or stand up straight.', 'Clean the dumbbell up to bring it to shoulder height. The other hand can be kept fully extended to the side, by the waist or grabbing a fixed surface.', 'Rotate the wrist so that the palm of your hand is facing forward. This is your starting position.', 'As you exhale, push the dumbbell up until your arm is fully extended.', 'After a second pause, slowly come down back to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions and then switch arms.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-one-arm-shoulder-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_One-Arm_Shoulder_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_One-Arm_Shoulder_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell One-Arm Triceps Extension', 'dumbbell-one-arm-triceps-extension', NULL, v_category_id, 'strength', 'isolation', 'push', 'intermediate', ARRAY['Grab a dumbbell and either sit on a military press bench or a utility bench that has a back support on it as you place the dumbbells upright on top of your thighs or stand up straight.', 'Clean the dumbbell up to bring it to shoulder height and then extend the arm over your head so that the whole arm is perpendicular to the floor and next to your head. The dumbbell should be on top of you. The other hand can be kept fully extended to the side, by the waist, supporting the upper arm that has the dumbbell or grabbing a fixed surface.', 'Rotate the wrist so that the palm of your hand is facing forward and the pinkie is facing the ceiling. This will be your starting position.', 'Slowly lower the dumbbell behind your head as you hold the upper arm stationary. Inhale as you perform this movement and pause when your triceps are fully stretched.', 'Return to the starting position by flexing your triceps as you breathe out. Tip: It is imperative that only the forearm moves. The upper arm should remain at all times stationary next to your head.', 'Repeat for the recommended amount of repetitions and switch arms.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-one-arm-triceps-extension';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_One-Arm_Triceps_Extension/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_One-Arm_Triceps_Extension/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell One-Arm Upright Row', 'dumbbell-one-arm-upright-row', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Grab a dumbbell and stand up straight with your arm extended in front of you with a slight bend at the elbows and your back straight. This will be your starting position. Tip: The dumbbell should be resting on top of your thigh with the palm of your hands facing your thighs.', 'Keep the other hand can be kept fully extended to the side, by the waist or grabbing a fixed surface. This will be your starting position.', 'Use your side shoulders to lift the dumbbell as you exhale. The dumbbell should be close to the body as you move it up. Continue to lift it until the dumbbell is nearly in line with your chin. Tip: Your elbows should drive the motion. As you lift the dumbbell, your elbow should always be higher than your forearm. Also, keep your torso stationary and pause for a second at the top of the movement.', 'Lower the dumbbell back down slowly to the starting position. Inhale as you perform this portion of the movement.', 'Repeat for the recommended amount of repetitions and switch arms.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-one-arm-upright-row';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_One-Arm_Upright_Row/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_One-Arm_Upright_Row/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Prone Incline Curl', 'dumbbell-prone-incline-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'intermediate', ARRAY['Grab a dumbbell on each hand and lie face down on an incline bench with your shoulders near top of the incline. Your knees can rest on the seat or your legs can be straddled to the sides (my preferred way).', 'Let your arms extend and hang naturally in front of you so that they are perpendicular to the floor.', 'Now keep your elbows in by your side and face the palms forward. This will be your starting position.', 'Raise the dumbbells by contracting the biceps until your arms are fully flexed. Exhale as you perform this portion of the movement and ensure that only the forearms move. The upper arms should remain stationary at all times.', 'Lower the dumbbells until your arms are fully extended.', 'Repeat for the recommended amount of times.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-prone-incline-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Prone_Incline_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Prone_Incline_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Raise', 'dumbbell-raise', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Grab a dumbbell in each arm and stand up straight with your arms extended by your sides with a slight bend at the elbows and your back straight. This will be your starting position. Tip: The dumbbell should be next to your thighs with the palm of your hands facing back.', 'Use your side shoulders to lift the dumbbells as you exhale. The dumbbells should be to the side of the body as you move them up. Continue to lift it until the dumbbells are nearly in line with your chin. Tip: Your elbows should drive the motion. As you lift the dumbbell, your elbow should always be higher than your forearm. Also, keep your torso stationary and pause for a second at the top of the movement.', 'Lower the dumbbells back down slowly to the starting position. Inhale as you perform this portion of the movement.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Rear Lunge', 'dumbbell-rear-lunge', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Stand with your torso upright holding two dumbbells in your hands by your sides. This will be your starting position.', 'Step backward with your right leg around two feet or so from the left foot and lower your upper body down, while keeping the torso upright and maintaining balance. Inhale as you go down. Tip: As in the other exercises, do not allow your knee to go forward beyond your toes as you come down, as this will put undue stress on the knee joint. Make sure that you keep your front shin perpendicular to the ground. Keep the torso upright during the lunge; flexible hip flexors are important. A long lunge emphasizes the Gluteus Maximus; a short lunge emphasizes Quadriceps.', 'Push up and go back to the starting position as you exhale. Tip: Use the ball of your feet to push in order to accentuate the quadriceps. To focus on the glutes, press with your heels.', 'Now repeat with the opposite leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-rear-lunge';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Rear_Lunge/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Rear_Lunge/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Scaption', 'dumbbell-scaption', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['This corrective exercise strengthens the muscles that stabilize your shoulder blade. Hold a light weight in each hand, hanging at your sides. Your thumbs should pointing up.', 'Begin the movement raising your arms out in front of you, about 30 degrees off center. Your arms should be fully extended as you perform the movement.', 'Continue until your arms are parallel to the ground, and then return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-scaption';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Scaption/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Scaption/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Seated One-Leg Calf Raise', 'dumbbell-seated-one-leg-calf-raise', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Place a block on the floor about 12 inches from a flat bench.', 'Sit on a flat bench and place a dumbbell on your upper left thigh about 3 inches above your knee.', 'Now place the ball of your left foot on the block. This will be your starting position.', 'Raise your toes up as high as possible as you exhale and you contract your calf muscle. Hold the contraction for a second.', 'Slowly return to the starting position, stretching as far down as possible.', 'Repeat for your prescribed number of repetitions and then repeat with the right leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-seated-one-leg-calf-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Seated_One-Leg_Calf_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Seated_One-Leg_Calf_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Shoulder Press', 'dumbbell-shoulder-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['While holding a dumbbell in each hand, sit on a military press bench or utility bench that has back support. Place the dumbbells upright on top of your thighs.', 'Now raise the dumbbells to shoulder height one at a time using your thighs to help propel them up into position.', 'Make sure to rotate your wrists so that the palms of your hands are facing forward. This is your starting position.', 'Now, exhale and push the dumbbells upward until they touch at the top.', 'Then, after a brief pause at the top contracted position, slowly lower the weights back down to the starting position while inhaling.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-shoulder-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Shoulder_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Shoulder_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Shrug', 'dumbbell-shrug', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand erect with a dumbbell on each hand (palms facing your torso), arms extended on the sides.', 'Lift the dumbbells by elevating the shoulders as high as possible while you exhale. Hold the contraction at the top for a second. Tip: The arms should remain extended at all times. Refrain from using the biceps to help lift the dumbbells. Only the shoulders should be moving up and down.', 'Lower the dumbbells back to the original position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-shrug';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Shrug/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Shrug/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Side Bend', 'dumbbell-side-bend', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up straight while holding a dumbbell on the left hand (palms facing the torso) as you have the right hand holding your waist. Your feet should be placed at shoulder width. This will be your starting position.', 'While keeping your back straight and your head up, bend only at the waist to the right as far as possible. Breathe in as you bend to the side. Then hold for a second and come back up to the starting position as you exhale. Tip: Keep the rest of the body stationary.', 'Now repeat the movement but bending to the left instead. Hold for a second and come back to the starting position.', 'Repeat for the recommended amount of repetitions and then change hands.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-side-bend';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Side_Bend/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Side_Bend/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Squat', 'dumbbell-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Stand up straight while holding a dumbbell on each hand (palms facing the side of your legs).', 'Position your legs using a shoulder width medium stance with the toes slightly pointed out. Keep your head up at all times as looking down will get you off balance and also maintain a straight back. This will be your starting position. Note: For the purposes of this discussion we will use the medium stance described above which targets overall development; however you can choose any of the three stances discussed in the foot stances section.', 'Begin to slowly lower your torso by bending the knees as you maintain a straight posture with the head up. Continue down until your thighs are parallel to the floor. Tip: If you performed the exercise correctly, the front of the knees should make an imaginary straight line with the toes that is perpendicular to the front. If your knees are past that imaginary line (if they are past your toes) then you are placing undue stress on the knee and the exercise has been performed incorrectly.', 'Begin to raise your torso as you exhale by pushing the floor with the heel of your foot mainly as you straighten the legs again and go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Squat To A Bench', 'dumbbell-squat-to-a-bench', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Stand up straight with a flat bench behind you while holding a dumbbell on each hand (palms facing the side of your legs).', 'Position your legs using a shoulder width medium stance with the toes slightly pointed out. Keep your head up at all times as looking down will get you off balance and also maintain a straight back. This will be your starting position. Note: For the purposes of this discussion we will use the medium stance described above which targets overall development; however you can choose any of the three stances discussed in the foot stances section.', 'Begin to slowly lower your torso by bending the knees as you maintain a straight posture with the head up. Continue down until you slightly touch the bench behind you. Inhale as you perform this portion of the movement. Tip: If you performed the exercise correctly, the front of the knees should make an imaginary straight line with the toes that is perpendicular to the front. If your knees are past that imaginary line (if they are past your toes) then you are placing undue stress on the knee and the exercise has been performed incorrectly.', 'Begin to raise the bar as you exhale by pushing the floor with the heel of your foot mainly as you straighten the legs again and go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-squat-to-a-bench';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Squat_To_A_Bench/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Squat_To_A_Bench/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Step Ups', 'dumbbell-step-ups', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Stand up straight while holding a dumbbell on each hand (palms facing the side of your legs).', 'Place the right foot on the elevated platform. Step on the platform by extending the hip and the knee of your right leg. Use the heel mainly to lift the rest of your body up and place the foot of the left leg on the platform as well. Breathe out as you execute the force required to come up.', 'Step down with the left leg by flexing the hip and knee of the right leg as you inhale. Return to the original standing position by placing the right foot of to next to the left foot on the initial position.', 'Repeat with the right leg for the recommended amount of repetitions and then perform with the left leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-step-ups';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Step_Ups/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Step_Ups/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Tricep Extension -Pronated Grip', 'dumbbell-tricep-extension-pronated-grip', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Lie down on a flat bench holding two dumbbells directly above your shoulders. Your arms should be fully extended and form a 90 degree angle from your torso and the floor.', 'The palms of your hands should be facing forward, and your elbows should be tucked in. This will be your starting position.', 'Now, inhale and slowly lower the dumbbells until they are near your ears. Be sure to keep your upper arms stationary and your elbows tucked in.', 'Then, exhale and use your triceps to return the weight to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-tricep-extension-pronated-grip';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Tricep_Extension_-Pronated_Grip/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Tricep_Extension_-Pronated_Grip/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('EZ-Bar Curl', 'ez-bar-curl', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up straight while holding an EZ curl bar at the wide outer handle. The palms of your hands should be facing forward and slightly tilted inward due to the shape of the bar. Keep your elbows close to your torso. This will be your starting position.', 'Now, while keeping your upper arms stationary, exhale and curl the weights forward while contracting the biceps. Focus on only moving your forearms.', 'Continue to raise the weight until your biceps are fully contracted and the bar is at shoulder level. Hold the top contracted position for a moment and squeeze the biceps.', 'Then inhale and slowly lower the bar back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'ez-bar-curl';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'EZ Curl Bar' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/EZ-Bar_Curl/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/EZ-Bar_Curl/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('EZ-Bar Skullcrusher', 'ez-bar-skullcrusher', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Using a close grip, lift the EZ bar and hold it with your elbows in as you lie on the bench. Your arms should be perpendicular to the floor. This will be your starting position.', 'Keeping the upper arms stationary, lower the bar by allowing the elbows to flex. Inhale as you perform this portion of the movement. Pause once the bar is directly above the forehead.', 'Lift the bar back to the starting position by extending the elbow and exhaling.', 'Repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'ez-bar-skullcrusher';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'EZ Curl Bar' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/EZ-Bar_Skullcrusher/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/EZ-Bar_Skullcrusher/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Elbow to Knee', 'elbow-to-knee', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Lie on the floor, crossing your right leg across your bent left knee. Clasp your hands behind your head, beginning with your shoulder blades on the ground. This will be your starting position.', 'Perform the motion by flexing the spine and rotating your torso to bring the left elbow to the right knee.', 'Return to the starting position and repeat the movement for the desired number of repetitions before switching sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'elbow-to-knee';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Elbow_to_Knee/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Elbow_to_Knee/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Elevated Back Lunge', 'elevated-back-lunge', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Position a bar onto a rack at shoulder height loaded to an appropriate weight. Place a short, raised platform behind you.', 'Rack the bar onto your upper back, keeping your back arched and tight. Step onto your raised platform with both feet. This will be your starting position.', 'Begin by stepping backwards with one leg. Descend by flexing your hips and knees until your knee touches the floor.', 'Pause, and extend through the hips and knees to rise up, returning all the way to the starting position before alternating.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'elevated-back-lunge';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Elevated_Back_Lunge/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Elevated_Back_Lunge/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Elevated Cable Rows', 'elevated-cable-rows', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Get a platform of some sort (it can be an aerobics or calf raise platform) that is around 4-6 inches in height.', 'Place it on the seat of the cable row machine.', 'Sit down on the machine and place your feet on the front platform or crossbar provided making sure that your knees are slightly bent and not locked.', 'Lean over as you keep the natural alignment of your back and grab the V-bar handles.', 'With your arms extended pull back until your torso is at a 90-degree angle from your legs. Your back should be slightly arched and your chest should be sticking out. You should be feeling a nice stretch on your lats as you hold the bar in front of you. This is the starting position of the exercise.', 'Keeping the torso stationary, pull the handles back towards your torso while keeping the arms close to it until you touch the abdominals. Breathe out as you perform that movement. At that point you should be squeezing your back muscles hard. Hold that contraction for a second and slowly go back to the original position while breathing in.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'elevated-cable-rows';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Elevated_Cable_Rows/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Elevated_Cable_Rows/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Exercise Ball Crunch', 'exercise-ball-crunch', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Lie on an exercise ball with your lower back curvature pressed against the spherical surface of the ball. Your feet should be bent at the knee and pressed firmly against the floor. The upper torso should be hanging off the top of the ball. The arms should either be kept alongside the body or crossed on top of your chest as these positions avoid neck strains (as opposed to the hands behind the back of the head position).', 'Lower your torso into a stretch position keeping the neck stationary at all times. This will be your starting position.', 'With the hips stationary, flex the waist by contracting the abdominals and curl the shoulders and trunk upward until you feel a nice contraction on your abdominals. The arms should simply slide up the side of your legs if you have them at the side or just stay on top of your chest if you have them crossed. The lower back should always stay in contact with the ball. Exhale as you perform this movement and hold the contraction for a second.', 'As you inhale, go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'exercise-ball-crunch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Exercise Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Exercise_Ball_Crunch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Exercise_Ball_Crunch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Exercise Ball Pull-In', 'exercise-ball-pull-in', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Place an exercise ball nearby and lay on the floor in front of it with your hands on the floor shoulder width apart in a push-up position.', 'Now place your lower shins on top of an exercise ball. Tip: At this point your legs should be fully extended with the shins on top of the ball and the upper body should be in a push-up type of position being supported by your two extended arms in front of you. This will be your starting position.', 'While keeping your back completely straight and the upper body stationary, pull your knees in towards your chest as you exhale, allowing the ball to roll forward under your ankles. Squeeze your abs and hold that position for a second.', 'Now slowly straighten your legs, rolling the ball back to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'exercise-ball-pull-in';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Exercise Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Exercise_Ball_Pull-In/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Exercise_Ball_Pull-In/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Extended Range One-Arm Kettlebell Floor Press', 'extended-range-one-arm-kettlebell-floor-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Lie on the floor and position a kettlebell for one arm to press. The kettlebell should be held by the handle. The leg on the same side that you are pressing should be bent, with the knee crossing over the midline of the body.', 'Press the kettlebell by extending the elbow and adducting the arm, pressing it above your body. Return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'extended-range-one-arm-kettlebell-floor-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Extended_Range_One-Arm_Kettlebell_Floor_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Extended_Range_One-Arm_Kettlebell_Floor_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('External Rotation', 'external-rotation', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Lie sideways on a flat bench with one arm holding a dumbbell and the other hand on top of the bench folded so that you can rest your head on it.', 'Bend the elbows of the arm holding the dumbbell so that it creates a 90-degree angle between the upper arm and the forearm. Tip: Keep the arm parallel to your torso.', 'Now bend the elbow while keeping the upper arm stationary. In this manner, the forearm will be parallel to the floor and perpendicular to your torso (Tip: So the forearm will be directly in front of you). The upper arm will be stationary by your torso and should be parallel to the floor (aligned with your torso at all times). This will be your starting position.', 'As you breathe out, externally rotate your forearm so that the dumbbell is lifted up in a semicircle motion as you maintain the 90 degree angle bend between the upper arms and the forearm. You will continue this external rotation until the forearm is perpendicular to the floor and the torso pointing towards the ceiling. At this point you will hold the contraction for a second.', 'As you breathe in, slowly go back to the starting position.', 'Repeat for the recommended amount of repetitions and then switch to the other arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'external-rotation';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/External_Rotation/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/External_Rotation/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('External Rotation with Band', 'external-rotation-with-band', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Choke the band around a post. The band should be at the same height as your elbow. Stand with your left side to the band a couple of feet away.', 'Grasp the end of the band with your right hand, and keep your elbow pressed firmly to your side. We recommend you hold a pad or foam roll in place with your elbow to keep it firmly in position.', 'With your upper arm in position, your elbow should be flexed to 90 degrees with your hand reaching across the front of your torso. This will be your starting position.', 'Execute the movement by rotating your arm in a backhand motion, keeping your elbow in place.', 'Continue as far as you are able, pause, and then return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'external-rotation-with-band';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Resistance Band' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/External_Rotation_with_Band/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/External_Rotation_with_Band/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('External Rotation with Cable', 'external-rotation-with-cable', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Adjust the cable to the same height as your elbow. Stand with your left side to the band a couple of feet away.', 'Grasp the handle with your right hand, and keep your elbow pressed firmly to your side. We recommend you hold a pad or foam roll in place with your elbow to keep it firmly in position.', 'With your upper arm in position, your elbow should be flexed to 90 degrees with your hand reaching across the front of your torso. This will be your starting position.', 'Execute the movement by rotating your arm in a backhand motion, keeping your elbow in place.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'external-rotation-with-cable';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/External_Rotation_with_Cable/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/External_Rotation_with_Cable/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Face Pull', 'face-pull', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Facing a high pulley with a rope or dual handles attached, pull the weight directly towards your face, separating your hands as you do so. Keep your upper arms parallel to the ground.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'face-pull';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Face_Pull/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Face_Pull/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Finger Curls', 'finger-curls', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Hold a barbell with both hands and your palms facing up; hands spaced about shoulder width.', 'Place your feet flat on the floor, at a distance that is slightly wider than shoulder width apart. This will be your starting position.', 'Lower the bar as far as possible by extending the fingers. Allowing the bar to roll down the hands, catch the bar with the final joint in the fingers.', 'Now curl bar up as high as possible by closing your hands while exhaling. Hold the contraction at the top.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'finger-curls';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Finger_Curls/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Finger_Curls/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Flat Bench Cable Flyes', 'flat-bench-cable-flyes', NULL, v_category_id, 'strength', 'isolation', 'push', 'intermediate', ARRAY['Position a flat bench between two low pulleys so that when you are laying on it, your chest will be lined up with the cable pulleys.', 'Lay flat on the bench and keep your feet on the ground.', 'Have someone hand you the handles on each hand. You will grab each single handle attachment with a palms up grip.', 'Extend your arms by your side with a slight bend on your elbows. Tip: You will keep this bend constant through the whole movement. Your arms should be parallel to the floor. This is your starting position.', 'Now start lifting the arms in a semi-circle motion directly in front of you by pulling the cables together until both hands meet at the top of the movement. Squeeze your chest as you perform this motion and breathe out during this movement. Also, hold the contraction for a second at the top. Tip: When performed correctly, at the top position of this movement, your arms should be perpendicular to your torso and the floor touching above your chest.', 'Slowly come back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'flat-bench-cable-flyes';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Flat_Bench_Cable_Flyes/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Flat_Bench_Cable_Flyes/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Flat Bench Leg Pull-In', 'flat-bench-leg-pull-in', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Lie on an exercise mat or a flat bench with your legs off the end.', 'Place your hands either under your glutes with your palms down or by the sides holding on to the bench (or with palms down by the side on an exercise mat). Also extend your legs straight out. This will be your starting position.', 'Bend your knees and pull your upper thighs into your midsection as you breathe out. Continue this movement until your knees are near your chest. Hold the contracted position for a second.', 'As you breathe in, slowly return to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'flat-bench-leg-pull-in';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Flat_Bench_Leg_Pull-In/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Flat_Bench_Leg_Pull-In/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Flat Bench Lying Leg Raise', 'flat-bench-lying-leg-raise', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Lie with your back flat on a bench and your legs extended in front of you off the end.', 'Place your hands either under your glutes with your palms down or by the sides holding on to the bench. This will be your starting position.', 'As you keep your legs extended, straight as possible with your knees slightly bent but locked raise your legs until they make a 90-degree angle with the floor. Exhale as you perform this portion of the movement and hold the contraction at the top for a second.', 'Now, as you inhale, slowly lower your legs back down to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'flat-bench-lying-leg-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Flat_Bench_Lying_Leg_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Flat_Bench_Lying_Leg_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Flexor Incline Dumbbell Curls', 'flexor-incline-dumbbell-curls', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Hold the dumbbell towards the side farther from you so that you have more weight on the side closest to you. (This can be done for a good effect on all bicep dumbbell exercises). Now do a normal incline dumbbell curl, but keep your wrists as far back as possible so as to neutralize any stress that is placed on them.', 'Sit on an incline bench that is angled at 45-degrees while holding a dumbbell on each hand.', 'Let your arms hang down on your sides, with the elbows in, and turn the palms of your hands forward with the thumbs pointing away from the body. Tip: You will keep this hand position throughout the movement as there should not be any twisting of the hands as they come up. This will be your starting position.', 'Curl up the two dumbbells at the same time until your biceps are fully contracted and exhale. Tip: Do not swing the arms or use momentum. Keep a controlled motion at all times. Hold the contracted position for a second at the top.', 'As you inhale, slowly go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'flexor-incline-dumbbell-curls';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Flexor_Incline_Dumbbell_Curls/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Flexor_Incline_Dumbbell_Curls/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Floor Glute-Ham Raise', 'floor-glute-ham-raise', NULL, v_category_id, 'strength', 'isolation', 'pull', 'intermediate', ARRAY['You can use a partner for this exercise or brace your feet under something stable.', 'Begin on your knees with your upper legs and torso upright. If using a partner, they will firmly hold your feet to keep you in position. This will be your starting position.', 'Lower yourself by extending at the knee, taking care to NOT flex the hips as you go forward.', 'Place your hands in front of you as you reach the floor. This movement is very difficult and you may be unable to do it unaided. Use your arms to lightly push off the floor to aid your return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'floor-glute-ham-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Floor_Glute-Ham_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Floor_Glute-Ham_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Flutter Kicks', 'flutter-kicks', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['On a flat bench lie facedown with the hips on the edge of the bench, the legs straight with toes high off the floor and with the arms on top of the bench holding on to the front edge.', 'Squeeze your glutes and hamstrings and straighten the legs until they are level with the hips. This will be your starting position.', 'Start the movement by lifting the left leg higher than the right leg.', 'Then lower the left leg as you lift the right leg.', 'Continue alternating in this manner (as though you are doing a flutter kick in water) until you have done the recommended amount of repetitions for each leg. Make sure that you keep a controlled movement at all times. Tip: You will breathe normally as you perform this movement.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'flutter-kicks';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Flutter_Kicks/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Flutter_Kicks/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Freehand Jump Squat', 'freehand-jump-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Cross your arms over your chest.', 'With your head up and your back straight, position your feet at shoulder width.', 'Keeping your back straight and chest up, squat down as you inhale until your upper thighs are parallel, or lower, to the floor.', 'Now pressing mainly with the ball of your feet, jump straight up in the air as high as possible, using the thighs like springs. Exhale during this portion of the movement.', 'When you touch the floor again, immediately squat down and jump again.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'freehand-jump-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Freehand_Jump_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Freehand_Jump_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Frog Sit-Ups', 'frog-sit-ups', NULL, v_category_id, 'strength', 'isolation', 'pull', 'intermediate', ARRAY['Lie with your back flat on the floor (or exercise mat) and your legs extended in front of you.', 'Now bend at the knees and place your outer thighs by the floor (or mat) as you make the soles of your feet touch each other.', 'Now try pushing both soles and bringing them up as near you as possible while you keep the outer thighs on the floor (or at least almost touching it). Tip: In this position your legs should create a diamond shape.', 'Now, cross your arms in front of you by touching the opposite shoulders. This will be your starting position.', 'As you exhale flatten your lower back to the floor while curling the torso upwards. Tip: This will be like performing the first 1/4 movement of a sit up. Hold at the top position for a second.', 'As you inhale, slowly lower back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'frog-sit-ups';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Frog_Sit-Ups/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Frog_Sit-Ups/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Barbell Squat', 'front-barbell-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'advanced', ARRAY['This exercise is best performed inside a squat rack for safety purposes. To begin, first set the bar on a rack that best matches your height. Once the correct height is chosen and the bar is loaded, bring your arms up under the bar while keeping the elbows high and the upper arm slightly above parallel to the floor. Rest the bar on top of the deltoids and cross your arms while grasping the bar for total control.', 'Lift the bar off the rack by first pushing with your legs and at the same time straightening your torso.', 'Step away from the rack and position your legs using a shoulder width medium stance with the toes slightly pointed out. Keep your head up at all times as looking down will get you off balance and also maintain a straight back. This will be your starting position. (Note: For the purposes of this discussion we will use the medium stance described above which targets overall development; however you can choose any of the three stances described in the foot positioning section).', 'Begin to slowly lower the bar by bending the knees as you maintain a straight posture with the head up. Continue down until the angle between the upper leg and the calves becomes slightly less than 90-degrees (which is the point in which the upper legs are below parallel to the floor). Inhale as you perform this portion of the movement. Tip: If you performed the exercise correctly, the front of the knees should make an imaginary straight line with the toes that is perpendicular to the front. If your knees are past that imaginary line (if they are past your toes) then you are placing undue stress on the knee and the exercise has been performed incorrectly.', 'Begin to raise the bar as you exhale by pushing the floor mainly with the middle of your foot as you straighten the legs again and go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-barbell-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Barbell_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Barbell_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Barbell Squat To A Bench', 'front-barbell-squat-to-a-bench', NULL, v_category_id, 'strength', 'compound', 'push', 'advanced', ARRAY['This exercise is best performed inside a squat rack for safety purposes. To begin, first set a flat bench behind you and set the bar on a rack that best matches your height. Once the correct height is chosen and the bar is loaded, bring your arms up under the bar while keeping the elbows high and the upper arm slightly above parallel to the floor. Rest the bar on top of the deltoids and cross your arms while grasping the bar for total control.', 'Lift the bar off the rack by first pushing with your legs and at the same time straightening your torso.', 'Step away from the rack and position your legs using a shoulder width medium stance with the toes slightly pointed out. Keep your head up at all times as looking down will get you off balance and also maintain a straight back. This will be your starting position. (Note: For the purposes of this discussion we will use the medium stance described above which targets overall development; however you can choose any of the three stances described in the foot positioning section).', 'Begin to slowly lower the bar by bending the knees as you maintain a straight posture with the head up. Continue down until you touch the bench with your glutes. Inhale as you perform this portion of the movement. Tip: If you performed the exercise correctly, the front of the knees should make an imaginary straight line with the toes that is perpendicular to the front. If your knees are past that imaginary line (if they are past your toes) then you are placing undue stress on the knee and the exercise has been performed incorrectly.', 'Begin to raise the bar as you exhale by pushing the floor mainly with the heel of your foot as you straighten the legs again and go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-barbell-squat-to-a-bench';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Barbell_Squat_To_A_Bench/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Barbell_Squat_To_A_Bench/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Cable Raise', 'front-cable-raise', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Select the weight on a low pulley machine and grasp the single hand cable attachment that is attached to the low pulley with your left hand.', 'Face away from the pulley and put your arm straight down with the hand cable attachment in front of your thighs at arms'' length with the palms of the hand facing your thighs. This will be your starting position.', 'While maintaining the torso stationary (no swinging), lift the left arm to the front with a slight bend on the elbow and the palms of the hand always faces down. Continue to go up until you arm is slightly above parallel to the floor. Exhale as you execute this portion of the movement and pause for a second at the top.', 'Now as you inhale lower the arm back down slowly to the starting position.', 'Once all of the recommended amount of repetitions have been performed for this arm, switch arms and perform the exercise with the right one.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-cable-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Cable_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Cable_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Dumbbell Raise', 'front-dumbbell-raise', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Pick a couple of dumbbells and stand with a straight torso and the dumbbells on front of your thighs at arms length with the palms of the hand facing your thighs. This will be your starting position.', 'While maintaining the torso stationary (no swinging), lift the left dumbbell to the front with a slight bend on the elbow and the palms of the hands always facing down. Continue to go up until you arm is slightly above parallel to the floor. Exhale as you execute this portion of the movement and pause for a second at the top. Inhale after the second pause.', 'Now lower the dumbbell back down slowly to the starting position as you simultaneously lift the right dumbbell.', 'Continue alternating in this fashion until all of the recommended amount of repetitions have been performed for each arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-dumbbell-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Dumbbell_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Dumbbell_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Incline Dumbbell Raise', 'front-incline-dumbbell-raise', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Sit down on an incline bench with the incline set anywhere between 30 to 60 degrees while holding a dumbbell on each hand. Tip: You can change the angle to hit the muscle a little differently each time.', 'Extend your arms straight in front of you and have your palms facing down with the dumbbells raised about 1 inch above your thighs. This will be your starting position.', 'Slowly raise the dumbbells straight up until they are slightly above your shoulders, while keeping your elbows locked. Squeeze at the top for a second and make sure you breathe out during this portion of the movement. Tip: Keep your head resting down against the bench and your legs on the floor at all times.', 'Lower the arms back to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-incline-dumbbell-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Incline_Dumbbell_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Incline_Dumbbell_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Plate Raise', 'front-plate-raise', NULL, v_category_id, 'strength', 'isolation', 'push', 'intermediate', ARRAY['While standing straight, hold a barbell plate in both hands at the 3 and 9 o''clock positions. Your palms should be facing each other and your arms should be extended and locked with a slight bend at the elbows and the plate should be down near your waist in front of you as far as you can go. Tip: The arms will remain in this position throughout the exercise. This will be your starting position.', 'Slowly raise the plate as you exhale until it is a little above shoulder level. Hold the contraction for a second. Tip: make sure that you do not swing the weight or bend at the elbows. Your torso should remain stationary throughout the movement as well.', 'As you inhale, slowly lower the plate back down to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-plate-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Plate_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Plate_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Raise And Pullover', 'front-raise-and-pullover', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Lie on a flat bench while holding a barbell using a palms down grip that is about 15 inches apart.', 'Place the bar on your upper thighs, extend your arms and lock them while keeping a slight bend on the elbows. This will be your starting position.', 'Now raise the weight using a semicircular motion and keeping your arms straight as you inhale. Continue the same movement until the bar is on the other side above your head . (Tip: the bar will travel approximately 180-degrees). At this point your arms should be parallel to the floor with the palms of your hands facing the ceiling.', 'Now return the barbell to the starting position by reversing the motion as you exhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-raise-and-pullover';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Raise_And_Pullover/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Raise_And_Pullover/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Squat (Clean Grip)', 'front-squat-clean-grip', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['To begin, first set the bar in a rack slightly below shoulder level. Rest the bar on top of the deltoids, pushing into the clavicles, and lightly touching the throat. Your hands should be in a clean grip, touching the bar only with your fingers to help keep it in position.', 'Lift the bar off the rack by first pushing with your legs and at the same time straightening your torso. Step away from the rack and position your legs using a shoulder width medium stance with the toes slightly pointed out. Keep your head and elbows up at all times. This will be your starting position.', 'Bend at the knees, sitting down between your legs. Continue down until your hamstrings are on your calves. Keep your knees aligned with your feet by consciously using your abductors to push your knees out as you squat.', 'Begin to raise the bar as you exhale by pushing the floor mainly with the heel or middle of your foot as you straighten the legs again and return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-squat-clean-grip';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Squat_Clean_Grip/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Squat_Clean_Grip/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Squats With Two Kettlebells', 'front-squats-with-two-kettlebells', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Clean two kettlebells to your shoulders. Clean the kettlebells to your shoulders by extending through the legs and hips as you pull the kettlebells towards your shoulders. Rotate your wrists as you do so.', 'Looking straight ahead at all times, squat as low as you can and pause at the bottom. As you squat down, push your knees out. You should squat between your legs, keeping an upright torso, with your head and chest up.', 'Rise back up by driving through your heels and repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-squats-with-two-kettlebells';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Squats_With_Two_Kettlebells/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Squats_With_Two_Kettlebells/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Two-Dumbbell Raise', 'front-two-dumbbell-raise', NULL, v_category_id, 'strength', 'isolation', 'push', 'beginner', ARRAY['Pick a couple of dumbbells and stand with a straight torso and the dumbbells on front of your thighs at arms length with the palms of the hand facing your thighs. This will be your starting position.', 'While maintaining the torso stationary (no swinging), lift the dumbbells to the front with a slight bend on the elbow and the palms of the hands always facing down. Continue to go up until you arms are slightly above parallel to the floor. Exhale as you execute this portion of the movement and pause for a second at the top.', 'As you inhale, lower the dumbbells back down slowly to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-two-dumbbell-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Two-Dumbbell_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Two-Dumbbell_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Full Range-Of-Motion Lat Pulldown', 'full-range-of-motion-lat-pulldown', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Either standing or seated on a high bench, grasp two stirrup cables that are attached to the high pulleys. Grab with the opposing hand so your arms are crisscrossed about you and your palms are facing forward.', 'Keeping your chest up and maintaining a slight arch in your lower back, pull the handles down as if you were doing a regular pulldown. The range of motion will be more of an arc. During the movement, rotate your hands so that in the bottom position your palms face each other rather than forward. Return slowly to the starting position and repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'full-range-of-motion-lat-pulldown';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Full_Range-Of-Motion_Lat_Pulldown/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Full_Range-Of-Motion_Lat_Pulldown/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Gironda Sternum Chins', 'gironda-sternum-chins', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Grasp the pull-up bar with a shoulder width underhand grip.', 'Now hang with your arms fully extended and stick your chest out and lean back. Tip: You will be leaning back throughout the entire movement. This will be your starting position.', 'Start pulling yourself towards the bar with your spine arched throughout the movement and your head leaning back as far away from the bar as possible. Exhale as you perform this portion of the movement. Tip: At the upper end of the movement, your hips and legs will be at about a 45-degree angle to the floor.', 'Keep pulling until your collarbone passes the bar and your lower chest or sternum area touches it. Hold that contraction for a second. Tip: By the time you''ve completed this portion of the movement; your head will be parallel to the floor.', 'Slowly start going back to the starting position as you inhale.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'gironda-sternum-chins';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Gironda_Sternum_Chins/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Gironda_Sternum_Chins/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Glute Kickback', 'glute-kickback', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Kneel on the floor or an exercise mat and bend at the waist with your arms extended in front of you (perpendicular to the torso) in order to get into a kneeling push-up position but with the arms spaced at shoulder width. Your head should be looking forward and the bend of the knees should create a 90-degree angle between the hamstrings and the calves. This will be your starting position.', 'As you exhale, lift up your right leg until the hamstrings are in line with the back while maintaining the 90-degree angle bend. Contract the glutes throughout this movement and hold the contraction at the top for a second. Tip: At the end of the movement the upper leg should be parallel to the floor while the calf should be perpendicular to it.', 'Go back to the initial position as you inhale and now repeat with the left leg.', 'Continue to alternate legs until all of the recommended repetitions have been performed.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'glute-kickback';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Glute_Kickback/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Glute_Kickback/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Goblet Squat', 'goblet-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Stand holding a light kettlebell by the horns close to your chest. This will be your starting position.', 'Squat down between your legs until your hamstrings are on your calves. Keep your chest and head up and your back straight.', 'At the bottom position, pause and use your elbows to push your knees out. Return to the starting position, and repeat for 10-20 repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'goblet-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Kettlebell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Goblet_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Goblet_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Gorilla Chin/Crunch', 'gorilla-chin-crunch', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Hang from a chin-up bar using an underhand grip (palms facing you) that is slightly wider than shoulder width.', 'Now bend your knees at a 90 degree angle so that the calves are parallel to the floor while the thighs remain perpendicular to it. This will be your starting position.', 'As you exhale, pull yourself up while crunching your knees up at the same time until your knees are at chest level. You will stop going up as soon as your nose is at the same level as the bar. Tip: When you get to this point you should also be finishing the crunch at the same time.', 'Slowly start to inhale as you return to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'gorilla-chin-crunch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Gorilla_Chin_Crunch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Gorilla_Chin_Crunch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hack Squat', 'hack-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Place the back of your torso against the back pad of the machine and hook your shoulders under the shoulder pads provided.', 'Position your legs in the platform using a shoulder width medium stance with the toes slightly pointed out. Tip: Keep your head up at all times and also maintain the back on the pad at all times.', 'Place your arms on the side handles of the machine and disengage the safety bars (which on most designs is done by moving the side handles from a facing front position to a diagonal position).', 'Now straighten your legs without locking the knees. This will be your starting position. (Note: For the purposes of this discussion we will use the medium stance described above which targets overall development; however you can choose any of the three stances described in the foot positioning section).', 'Begin to slowly lower the unit by bending the knees as you maintain a straight posture with the head up (back on the pad at all times). Continue down until the angle between the upper leg and the calves becomes slightly less than 90-degrees (which is the point in which the upper legs are below parallel to the floor). Inhale as you perform this portion of the movement. Tip: If you performed the exercise correctly, the front of the knees should make an imaginary straight line with the toes that is perpendicular to the front. If your knees are past that imaginary line (if they are past your toes) then you are placing undue stress on the knee and the exercise has been performed incorrectly.', 'Begin to raise the unit as you exhale by pushing the floor with mainly with the heel of your foot as you straighten the legs again and go back to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hack-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Machine' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hack_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hack_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hammer Curls', 'hammer-curls', NULL, v_category_id, 'strength', 'isolation', 'pull', 'beginner', ARRAY['Stand up with your torso upright and a dumbbell on each hand being held at arms length. The elbows should be close to the torso.', 'The palms of the hands should be facing your torso. This will be your starting position.', 'Now, while holding your upper arm stationary, exhale and curl the weight forward while contracting the biceps. Continue to raise the weight until the biceps are fully contracted and the dumbbell is at shoulder level. Hold the contracted position for a brief moment as you squeeze the biceps. Tip: Focus on keeping the elbow stationary and only moving your forearm.', 'After the brief pause, inhale and slowly begin the lower the dumbbells back down to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hammer-curls';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hammer_Curls/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hammer_Curls/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hammer Grip Incline DB Bench Press', 'hammer-grip-incline-db-bench-press', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Lie back on an incline bench with a dumbbell on each hand on top of your thighs. The palms of your hand will be facing each other.', 'By using your thighs to help you get the dumbbells up, clean the dumbbells one arm at a time so that you can hold them at shoulder width.', 'Once at shoulder width, keep the palms of your hands with a neutral grip (palms facing each other). Keep your elbows flared out with the upper arms in line with the shoulders (perpendicular to the torso) and the elbows bent creating a 90-degree angle between the upper arm and the forearm. This will be your starting position.', 'Now bring down the weights slowly to your side as you breathe in. Keep full control of the dumbbells at all times.', 'As you breathe out, push the dumbbells up using your pectoral muscles. Lock your arms in the contracted position, hold for a second and then start coming down slowly. Tip: It should take at least twice as long to go down than to come up.', 'Repeat the movement for the prescribed amount of repetitions.', 'When you are done, place the dumbbells back in your thighs and then on the floor. This is the safest manner to dispose of the dumbbells.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hammer-grip-incline-db-bench-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hammer_Grip_Incline_DB_Bench_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hammer_Grip_Incline_DB_Bench_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Handstand Push-Ups', 'handstand-push-ups', NULL, v_category_id, 'strength', 'compound', 'push', 'advanced', ARRAY['With your back to the wall bend at the waist and place both hands on the floor at shoulder width.', 'Kick yourself up against the wall with your arms straight. Your body should be upside down with the arms and legs fully extended. Keep your whole body as straight as possible. Tip: If doing this for the first time, have a spotter help you. Also, make sure that you keep facing the wall with your head, rather than looking down.', 'Slowly lower yourself to the ground as you inhale until your head almost touches the floor. Tip: It is of utmost importance that you come down slow in order to avoid head injury.', 'Push yourself back up slowly as you exhale until your elbows are nearly locked.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'handstand-push-ups';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Handstand_Push-Ups/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Handstand_Push-Ups/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hanging Leg Raise', 'hanging-leg-raise', NULL, v_category_id, 'strength', 'isolation', 'pull', 'advanced', ARRAY['Hang from a chin-up bar with both arms extended at arms length in top of you using either a wide grip or a medium grip. The legs should be straight down with the pelvis rolled slightly backwards. This will be your starting position.', 'Raise your legs until the torso makes a 90-degree angle with the legs. Exhale as you perform this movement and hold the contraction for a second or so.', 'Go back slowly to the starting position as you breathe in.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hanging-leg-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hanging_Leg_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hanging_Leg_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hanging Pike', 'hanging-pike', NULL, v_category_id, 'strength', 'compound', 'pull', 'advanced', ARRAY['Hang from a chin-up bar with your legs and feet together using an overhand grip (palms facing away from you) that is slightly wider than shoulder width. Tip: You may use wrist wraps in order to facilitate holding on to the bar.', 'Now bend your knees at a 90 degree angle and bring the upper legs forward so that the calves are perpendicular to the floor while the thighs remain parallel to it. This will be your starting position.', 'Pull your legs up as you exhale until you almost touch your shins with the bar above you. Tip: Try to straighten your legs as much as possible while at the top.', 'Lower your legs as slowly as possible until you reach the starting position. Tip: Avoid swinging and using momentum at all times.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hanging-pike';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hanging_Pike/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hanging_Pike/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('High Cable Curls', 'high-cable-curls', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Stand between a couple of high pulleys and grab a handle in each arm. Position your upper arms in a way that they are parallel to the floor with the palms of your hands facing you. This will be your starting position.', 'Curl the handles towards you until they are next to your ears. Make sure that as you do so you flex your biceps and exhale. The upper arms should remain stationary and only the forearms should move. Hold for a second in the contracted position as you squeeze the biceps.', 'Slowly bring back the arms to the starting position.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'high-cable-curls';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Cable' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/High_Cable_Curls/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/High_Cable_Curls/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strength';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hip Extension with Bands', 'hip-extension-with-bands', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Secure one end of the band to the lower portion of a post and attach the other to one ankle.', 'Facing the attachment point of the band, hold on to the column to stabilize yourself.', 'Keeping your head and your chest up, move the resisted leg back as far as you can while keeping the knee straight.', 'Return the leg to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hip-extension-with-bands';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Resistance Band' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hip_Extension_with_Bands/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hip_Extension_with_Bands/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'cardio';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Prowler Sprint', 'prowler-sprint', NULL, v_category_id, 'cardio', 'compound', 'push', 'beginner', ARRAY['Place your sled on an appropriate surface, loaded to a suitable weight. The sled should provide enough resistance to require effort, but not so heavy that you are significantly slowed down.', 'You may use the upright or the low handles for this exercise. Place your hands on the handles with your arms extended, leaning into the implement.', 'With good posture, drive through the ground with alternating, short steps. Move as fast as you can for a short distance.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'prowler-sprint';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Prowler_Sprint/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Prowler_Sprint/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Adductor', 'adductor', NULL, v_category_id, 'mobility', 'isolation', 'static', 'intermediate', ARRAY['Lie face down with one leg on a foam roll.', 'Rotate the leg so that the foam roll contacts against your inner thigh. Shift as much weight onto the foam roll as can be tolerated.', 'While trying to relax the muscles if the inner thigh, roll over the foam between your hip and knee, holding points of tension for 10-30 seconds. Repeat with the other leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'adductor';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Foam Roller' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Adductor/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Adductor/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Ankle Circles', 'ankle-circles', NULL, v_category_id, 'mobility', 'isolation', 'pull', 'beginner', ARRAY['Use a sturdy object like a squat rack to hold yourself.', 'Lift the right leg in the air (just around 2 inches from the floor) and perform a circular motion with the big toe. Pretend that you are drawing a big circle with it. Tip: One circle equals 1 repetition. Breathe normally as you perform the movement.', 'When you are done with the right foot, then repeat with the left leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'ankle-circles';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Ankle_Circles/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Ankle_Circles/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Arm Circles', 'arm-circles', NULL, v_category_id, 'mobility', 'isolation', 'push', 'beginner', ARRAY['Stand up and extend your arms straight out by the sides. The arms should be parallel to the floor and perpendicular (90-degree angle) to your torso. This will be your starting position.', 'Slowly start to make circles of about 1 foot in diameter with each outstretched arm. Breathe normally as you perform the movement.', 'Continue the circular motion of the outstretched arms for about ten seconds. Then reverse the movement, going the opposite direction.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'arm-circles';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Arm_Circles/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Arm_Circles/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Behind Head Chest Stretch', 'behind-head-chest-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'advanced', ARRAY['Sit upright on the floor with your partner behind you.', 'Place your hands behind your hand, and push your elbows back as far as you can. Your partner should hold your elbows. This will be your starting position.', 'Gently attempt to pull your elbows forward with your hands still behind your head for 10 or more seconds. Your partner should prevent your elbows from moving.', 'Now, relax your muscles and have your partner gently pull the elbows back as far as it comfortable for you. Be sure to let your partner know when the stretch is adequate to prevent overstretching or injury.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'behind-head-chest-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Behind_Head_Chest_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Behind_Head_Chest_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Calf Stretch Elbows Against Wall', 'calf-stretch-elbows-against-wall', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Stand facing a wall from a couple feet away.', 'Lean against the wall, placing your weight on your forearms.', 'Attempt to keep your heels on the ground. Hold for 10-20 seconds. You may move further or closer the wall, making it more or less difficult, respectively.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'calf-stretch-elbows-against-wall';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Stretch_Elbows_Against_Wall/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Stretch_Elbows_Against_Wall/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Calf Stretch Hands Against Wall', 'calf-stretch-hands-against-wall', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Stand facing a wall from several feet away. Stagger your stance, placing one foot forward.', 'Lean forward and rest your hands on the wall, keeping your heel, hip and head in a straight line.', 'Attempt to keep your heel on the ground. Hold for 10-20 seconds and then switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'calf-stretch-hands-against-wall';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Stretch_Hands_Against_Wall/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Calf_Stretch_Hands_Against_Wall/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chair Leg Extended Stretch', 'chair-leg-extended-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Sit upright in a chair and grip the seat on the sides.', 'Raise one leg, extending the knee, flexing the ankle as you do so.', 'Slowly move that leg outward as far as you can, and then back to the center and down.', 'Repeat for your other leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chair-leg-extended-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chair_Leg_Extended_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chair_Leg_Extended_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chair Lower Back Stretch', 'chair-lower-back-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Sit upright on a chair.', 'Bend to one side with your arm over your head. You can hold onto the chair with your free hand.', 'Hold for 10 seconds, and repeat for your other side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chair-lower-back-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chair_Lower_Back_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chair_Lower_Back_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chest And Front Of Shoulder Stretch', 'chest-and-front-of-shoulder-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Start off by standing with your legs together, holding a bodybar or a broomstick.', 'Take a slightly wider than shoulder width grip on the pole and hold it in front of you with your palms facing down.', 'Carefully lift the pole up and behind your head.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chest-and-front-of-shoulder-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_And_Front_Of_Shoulder_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_And_Front_Of_Shoulder_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chest Stretch on Stability Ball', 'chest-stretch-on-stability-ball', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Get on your hands and knees next to an exercise ball.', 'Place your elbows on top of the ball, keeping your arm out to your side. This will be your starting position.', 'Lower your torso towards the floor, keeping your elbow on top of the ball. Hold the stretch for 20-30 seconds, and repeat with the other arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chest-stretch-on-stability-ball';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Exercise Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_Stretch_on_Stability_Ball/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_Stretch_on_Stability_Ball/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Elbow Circles', 'elbow-circles', NULL, v_category_id, 'mobility', 'isolation', 'pull', 'beginner', ARRAY['Sit or stand with your feet slightly apart.', 'Place your hands on your shoulders with your elbows at shoulder level and pointing out.', 'Slowly make a circle with your elbows. Breathe out as you start the circle and breathe in as you complete the circle.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'elbow-circles';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Elbow_Circles/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Elbow_Circles/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Elbows Back', 'elbows-back', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Stand up straight.', 'Place both hands on your lower back, fingers pointing downward and elbows out.', 'Then gently pull your elbows back aiming to touch them together.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'elbows-back';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Elbows_Back/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Elbows_Back/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Frog Hops', 'frog-hops', NULL, v_category_id, 'mobility', 'compound', 'push', 'intermediate', ARRAY['Stand with your hands behind your head, and squat down keeping your torso upright and your head up. This will be your starting position.', 'Jump forward several feet, avoiding jumping unnecessarily high. As your feet contact the ground, absorb the impact through your legs, and jump again. Repeat this action 5-10 times.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'frog-hops';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Frog_Hops/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Frog_Hops/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Groin and Back Stretch', 'groin-and-back-stretch', NULL, v_category_id, 'mobility', 'compound', 'static', 'intermediate', ARRAY['Sit on the floor with your knees bent and feet together.', 'Interlock your fingers behind your head. This will be your starting position.', 'Curl downwards, bringing your elbows to the inside of your thighs. After a brief pause, return to the starting position with your head up and your back straight. Repeat for 10-20 repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'groin-and-back-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Groin_and_Back_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Groin_and_Back_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Groiners', 'groiners', NULL, v_category_id, 'mobility', 'compound', 'pull', 'intermediate', ARRAY['Begin in a pushup position on the floor. This will be your starting position.', 'Using both legs, jump forward landing with your feet next to your hands. Keep your head up as you do so.', 'Return to the starting position and immediately repeat the movement, continuing for 10-20 repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'groiners';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Groiners/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Groiners/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hamstring Stretch', 'hamstring-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Lie on your back with one leg extended above you, with the hip at ninety degrees. Keep the other leg flat on the floor.', 'Loop a belt, band, or rope over the ball of your foot. This will be your starting position.', 'Pull on the belt to create tension in the calves and hamstrings. Hold this stretch for 10-30 seconds, and repeat with the other leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hamstring-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hamstring_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hamstring_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hamstring-SMR', 'hamstring-smr', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['In a seated position, extend your legs over a foam roll so that it is position on the back of the upper legs. Place your hands to the side or behind you to help support your weight. This will be your starting position.', 'Using your hands, lift your hips off of the floor and shift your weight on the foam roll to one leg. Relax the hamstrings of the leg you are stretching.', 'Roll over the foam from below the hip to above the back of the knee, pausing at points of tension for 10-30 seconds. Repeat for the other leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hamstring-smr';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Foam Roller' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hamstring-SMR/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hamstring-SMR/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hip Circles (prone)', 'hip-circles-prone', NULL, v_category_id, 'mobility', 'isolation', 'pull', 'beginner', ARRAY['Position yourself on your hands and knees on the ground. Maintaining good posture, raise one bent knee off of the ground. This will be your starting position.', 'Keeping the knee in a bent position, rotate the femur in an arc, attempting to make a big circle with your knee.', 'Perform this slowly for a number of repetitions, and repeat on the other side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hip-circles-prone';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hip_Circles_prone/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hip_Circles_prone/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hug A Ball', 'hug-a-ball', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Seat yourself on the floor.', 'Straddle an exercise ball between both legs and lower your hips down toward the floor.', 'Hug your arms around the ball to support your body. Adjust your legs so that your feet are flat on the floor and your knees line up over your ankles. Keep a good grip on the ball so it doesn''t roll away from you and send you back onto your buttocks.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hug-a-ball';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Exercise Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hug_A_Ball/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hug_A_Ball/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Iliotibial Tract-SMR', 'iliotibial-tract-smr', NULL, v_category_id, 'mobility', 'isolation', 'static', 'intermediate', ARRAY['Lay on your side, with the bottom leg placed onto a foam roller between the hip and the knee. The other leg can be crossed in front of you.', 'Place as much of your weight as is tolerable onto your bottom leg; there is no need to keep your bottom leg in contact with the ground. Be sure to relax the muscles of the leg you are stretching.', 'Roll your leg over the foam from you hip to your knee, pausing for 10-30 seconds at points of tension. Repeat with the opposite leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'iliotibial-tract-smr';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Foam Roller' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Iliotibial_Tract-SMR/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Iliotibial_Tract-SMR/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Intermediate Groin Stretch', 'intermediate-groin-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'intermediate', ARRAY['Lie on your back with your legs extended. Loop a belt, rope, or band around one of your feet, and swing that leg as far to the side as you can. This will be your starting position.', 'Pull gently on the belt to create tension in your groin and hamstring muscles. Hold for 10-20 seconds, and repeat on the other side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'intermediate-groin-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Intermediate_Groin_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Intermediate_Groin_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Intermediate Hip Flexor and Quad Stretch', 'intermediate-hip-flexor-and-quad-stretch', NULL, v_category_id, 'mobility', 'compound', 'static', 'intermediate', ARRAY['Lie face down on the floor, with a rope, belt, or band looped around one foot.', 'Flex the knee and extend the hip of the leg to be stretched, using both hands to pull on the belt. Your knee and your hip should come off of the floor, creating tension in the hip flexors and quadriceps. Hold the stretch for 10-20 seconds, and repeat on the other leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'intermediate-hip-flexor-and-quad-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Intermediate_Hip_Flexor_and_Quad_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Intermediate_Hip_Flexor_and_Quad_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Iron Crosses (stretch)', 'iron-crosses-stretch', NULL, v_category_id, 'mobility', 'compound', 'pull', 'intermediate', ARRAY['Lie face down on the floor, with your arms extended out to your side, palms pressed to the floor. This will be your starting position.', 'To begin, flex one knee and bring that leg across the back of your body, attempting to touch it to the ground near the opposite hand.', 'Promptly return the leg to the starting postion, and quickly repeat with the other leg. Continue alternating for 10-20 repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'iron-crosses-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Iron_Crosses_stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Iron_Crosses_stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Knee Circles', 'knee-circles', NULL, v_category_id, 'mobility', 'compound', 'pull', 'beginner', ARRAY['Stand with your legs together and hands by your waist.', 'Now move your knees in a circular motion as you breathe normally.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'knee-circles';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Knee_Circles/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Knee_Circles/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Kneeling Forearm Stretch', 'kneeling-forearm-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Start by kneeling on a mat with your palms flat and your fingers pointing back toward your knees.', 'Slowly lean back keeping your palms flat on the floor until you feel a stretch in your wrists and forearms. Hold for 20-30 seconds.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'kneeling-forearm-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Kneeling_Forearm_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Kneeling_Forearm_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Kneeling Hip Flexor', 'kneeling-hip-flexor', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Kneel on a mat and bring your right knee up so the bottom of your foot is on the floor and extend your left leg out behind you so the top of your foot is on the floor.', 'Shift your weight forward until you feel a stretch in your hip. Hold for 15 seconds, then repeat for your other side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'kneeling-hip-flexor';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Kneeling_Hip_Flexor/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Kneeling_Hip_Flexor/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Latissimus Dorsi-SMR', 'latissimus-dorsi-smr', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['While lying on the floor, place a foam roll under your back and to one side, just behind your arm pit. This will be your starting position.', 'Keep the arm of the side being stretched behind and to the side of you as you shift your weight onto your lats, keeping your upper body off of the ground. Hold for 10-30 seconds, and switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'latissimus-dorsi-smr';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Foam Roller' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Latissimus_Dorsi-SMR/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Latissimus_Dorsi-SMR/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Leg-Up Hamstring Stretch', 'leg-up-hamstring-stretch', NULL, v_category_id, 'mobility', 'isolation', 'push', 'beginner', ARRAY['Lie flat on your back, bend one knee, and put that foot flat on the floor to stabilize your spine.', 'Extend the other leg in the air. If you''re tight, you wont be able to straighten it. That''s okay. Extend the knee so that the sole of the lifted foot faces the ceiling (or as close as you can get it).', 'Slowly straighten the legs as much as possible and then pull the leg toward your nose. Switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'leg-up-hamstring-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Leg-Up_Hamstring_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Leg-Up_Hamstring_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Looking At Ceiling', 'looking-at-ceiling', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Kneel on the floor, holding your heels with both hands.', 'Lift your buttocks up and forward while bringing your head back to look up at the ceiling, to give an arch in your back.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'looking-at-ceiling';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Looking_At_Ceiling/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Looking_At_Ceiling/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Middle Back Stretch', 'middle-back-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Stand so your feet are shoulder width apart and your hands are on your hips.', 'Twist at your waist until you feel a stretch. Hold for 10 to 15 seconds, then twist to the other side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'middle-back-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Middle_Back_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Middle_Back_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('On Your Side Quad Stretch', 'on-your-side-quad-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Start off by lying on your right side, with your right knee bent at a 90-degree angle resting on the floor in front of you (this stabilizes the torso).', 'Bend your left knee behind you and hold your left foot with your left hand. To stretch your hip flexor, press your left hip forward as you push your left foot back into your hand. Switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'on-your-side-quad-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/On_Your_Side_Quad_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/On_Your_Side_Quad_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('On-Your-Back Quad Stretch', 'on-your-back-quad-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Lie on a flat bench or step, and hang one leg and arm over the side.', 'Bend the knee and hold the top of the foot. As you do this, be careful not to arch your lower back.', 'Pull the belly button to the spine to stay in neutral. Press your foot down and into your hand. To add the hip stretch, lift the hip of the leg you''re holding up toward the ceiling.', 'Switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'on-your-back-quad-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/On-Your-Back_Quad_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/On-Your-Back_Quad_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('One Arm Against Wall', 'one-arm-against-wall', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['From a standing position, place a bent arm against a wall or doorway.', 'Slowly lean toward your arm until you feel a stretch in your lats.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'one-arm-against-wall';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/One_Arm_Against_Wall/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/One_Arm_Against_Wall/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('One Knee To Chest', 'one-knee-to-chest', NULL, v_category_id, 'mobility', 'compound', 'static', 'beginner', ARRAY['Start off by lying on the floor.', 'Extend one leg straight and pull the other knee to your chest. Hold under the knee joint to protect the kneecap.', 'Gently tug that knee toward your nose.', 'Switch sides. This stretches the buttocks and lower back of the bent leg and the hip flexor of the straight leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'one-knee-to-chest';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/One_Knee_To_Chest/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/One_Knee_To_Chest/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Overhead Stretch', 'overhead-stretch', NULL, v_category_id, 'mobility', 'compound', 'static', 'beginner', ARRAY['Standing straight up, lace your fingers together and open your palms to the ceiling. Keep your shoulders down as you extend your arms up.', 'To create a full torso stretch, pull your tailbone down and stabilize your torso as you do this. Stretch the muscles on both the front and the back of the torso.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'overhead-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Overhead_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Overhead_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Pelvic Tilt Into Bridge', 'pelvic-tilt-into-bridge', NULL, v_category_id, 'mobility', 'compound', 'static', 'intermediate', ARRAY['Lie down with your feet on the floor, heels directly under your knees.', 'Lift only your tailbone to the ceiling to stretch your lower back. (Don''t lift the entire spine yet.) Pull in your stomach.', 'To go into a bridge, lift the entire spine except the neck.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'pelvic-tilt-into-bridge';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Pelvic_Tilt_Into_Bridge/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Pelvic_Tilt_Into_Bridge/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Piriformis-SMR', 'piriformis-smr', NULL, v_category_id, 'mobility', 'isolation', 'static', 'intermediate', ARRAY['Sit with your buttocks on top of a foam roll. Bend your knees, and then cross one leg so that the ankle is over the knee. This will be your starting position.', 'Shift your weight to the side of the crossed leg, rolling over the buttocks until you feel tension in your upper glute. You may assist the stretch by using one hand to pull the bent knee towards your chest. Hold this position for 10-30 seconds, and then switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'piriformis-smr';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Foam Roller' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Piriformis-SMR/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Piriformis-SMR/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Quadriceps-SMR', 'quadriceps-smr', NULL, v_category_id, 'mobility', 'isolation', 'static', 'intermediate', ARRAY['Lay facedown on the floor with your weight supported by your hands or forearms. Place a foam roll underneath one leg on the quadriceps, and keep the foot off of the ground. Make sure to relax the leg as much as possible. This will be your starting position.', 'Shifting as much weight onto the leg to be stretched as is tolerable, roll over the foam from above the knee to below the hip, holding points of tension for 10-30 seconds. Switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'quadriceps-smr';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Foam Roller' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Quadriceps-SMR/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Quadriceps-SMR/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Scissor Kick', 'scissor-kick', NULL, v_category_id, 'mobility', 'isolation', 'pull', 'beginner', ARRAY['To begin, lie down with your back pressed against the floor or on an exercise mat (optional). Your arms should be fully extended to the sides with your palms facing down. Note: The arms should be stationary the entire time.', 'With a slight bend at the knees, lift your legs up so that your heels are about 6 inches off the ground. This is the starting position.', 'Now lift your left leg up to about a 45 degree angle while your right leg is lowered until the heel is about 2-3 inches from the ground.', 'Switch movements by raising your right leg up and lowering your left leg. Remember to breathe while performing this exercise.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'scissor-kick';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Scissor_Kick/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Scissor_Kick/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Seated Biceps', 'seated-biceps', NULL, v_category_id, 'mobility', 'isolation', 'static', 'advanced', ARRAY['Sit on the floor with your knees bent and your partner standing behind you. Extend your arms straight behind you with your palms facing each other. Your partner will hold your wrists for you. This will be the starting position.', 'Attempt to flex your elbows, while your partner prevents any actual movement.', 'After 10-20 seconds, relax your arms while your partner gently pulls your wrists up to stretch your biceps. Be sure to let your partner know when the stretch is appropriate to prevent injury or overstretching.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'seated-biceps';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Seated_Biceps/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Seated_Biceps/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Seated Overhead Stretch', 'seated-overhead-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Sit up straight on an exercise mat.', 'Touch the soles of your feet together with your feet six to eight inches in front of your hips.', 'Place one hand on the floor beside you and your other hand behind your head.', 'Lift your elbow to the ceiling as you incline your torso to the other side. Hold for 10 to 20 seconds, then switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'seated-overhead-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Seated_Overhead_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Seated_Overhead_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Side Lying Groin Stretch', 'side-lying-groin-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Start off by lying on your right side and bend your right knee in front of you to stabilize the torso.', 'Rest your head on your right hand or shoulder. Lift your left leg upward and hold it by the back of the knee (easier) or the foot (harder).', 'Pull your left knee in toward your left shoulder and simultaneously press your foot or knee down to the floor. To intensify this stretch, straighten your left leg. Switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'side-lying-groin-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Side_Lying_Groin_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Side_Lying_Groin_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Side Neck Stretch', 'side-neck-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Start with your shoulders relaxed, gently tilt your head towards your shoulder.', 'Assist stretch with a gentle pull on the side of the head.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'side-neck-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'neck' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Side_Neck_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Side_Neck_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Side Wrist Pull', 'side-wrist-pull', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['This stretch works best standing. Cross your left arm over the midline of your body and hold the left wrist in your right hand down at the level of your hips. Start the stretch with a bent left arm.', 'Slowly straighten, pull, and lift it up to shoulder height, as pictured. Feel this stretch originate in your back, not your shoulders, and don''t pull too hard on the shoulders joint. Switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'side-wrist-pull';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Side_Wrist_Pull/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Side_Wrist_Pull/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Spinal Stretch', 'spinal-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Sit in a chair so your back is straight and your feet planted on the floor.', 'Interlace your fingers behind your head, elbows out and your chin down.', 'Twist your upper body to one side about 3 times as far as you can. Then lean forward and twist your torso to reach your elbow to the floor on the inside of your knee.', 'Return to upright position and then repeat for your other side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'spinal-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'neck' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Spinal_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Spinal_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Standing Biceps Stretch', 'standing-biceps-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Clasp your hands behind your back with your palms together, straighten arms and then rotate them so your palms face downward.', 'Raise your arms up and hold until you feel a stretch in your biceps.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'standing-biceps-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Standing_Biceps_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Standing_Biceps_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Standing Hip Circles', 'standing-hip-circles', NULL, v_category_id, 'mobility', 'isolation', 'pull', 'beginner', ARRAY['Begin standing on one leg, holding to a vertical support.', 'Raise the unsupported knee to 90 degrees. This will be your starting position.', 'Open the hip as far as possible, attempting to make a big circle with your knee.', 'Perform this movement slowly for a number of repetitions, and repeat on the other side.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'standing-hip-circles';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Standing_Hip_Circles/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Standing_Hip_Circles/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Standing Hip Flexors', 'standing-hip-flexors', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Stand up straight with the spine vertical, the left foot slightly in front of the right.', 'Bend both knees and lift the back heel off the floor as you press the right hip forward. You can''t get a thorough, deep stretch in this position, however, because it''s hard to relax the hip flexor and stand on it at the same time. Switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'standing-hip-flexors';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Standing_Hip_Flexors/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Standing_Hip_Flexors/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Standing Pelvic Tilt', 'standing-pelvic-tilt', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Start off with your feet hip-distance apart.', 'Bend your knees slightly to keep them soft and springy.', 'You may want to move your pelvis forward and backward and back few times before holding the tailbone forward in this stretch.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'standing-pelvic-tilt';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Standing_Pelvic_Tilt/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Standing_Pelvic_Tilt/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Standing Soleus And Achilles Stretch', 'standing-soleus-and-achilles-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Stand with your feet hip-distance apart, one foot slightly in front of the other.', 'Bend both knees, keeping your back heel on the floor. Switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'standing-soleus-and-achilles-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Standing_Soleus_And_Achilles_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Standing_Soleus_And_Achilles_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Stomach Vacuum', 'stomach-vacuum', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['To begin, stand straight with your feet shoulder width apart from each other. Place your hands on your hips. This is the starting position.', 'Now slowly inhale as much air as possible and then start to exhale as much as possible while bringing your stomach in as much as possible and hold this position. Try to visualize your navel touching your backbone.', 'One isometric contraction is around 20 seconds. During the 20 second hold, try to breathe normally. Then inhale and bring your stomach back to the starting position.', 'Once you have practiced this exercise, try to perform this exercise for longer than 20 seconds. Tip: You can work your way up to 40-60 seconds.', 'Repeat for the recommended amount of sets.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'stomach-vacuum';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Stomach_Vacuum/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Stomach_Vacuum/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Superman', 'superman', NULL, v_category_id, 'mobility', 'compound', 'static', 'beginner', ARRAY['To begin, lie straight and face down on the floor or exercise mat. Your arms should be fully extended in front of you. This is the starting position.', 'Simultaneously raise your arms, legs, and chest off of the floor and hold this contraction for 2 seconds. Tip: Squeeze your lower back to get the best results from this exercise. Remember to exhale during this movement. Note: When holding the contracted position, you should look like superman when he is flying.', 'Slowly begin to lower your arms, legs and chest back down to the starting position while inhaling.', 'Repeat for the recommended amount of repetitions prescribed in your program.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'superman';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Superman/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Superman/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Toe Touchers', 'toe-touchers', NULL, v_category_id, 'mobility', 'isolation', 'pull', 'beginner', ARRAY['To begin, lie down on the floor or an exercise mat with your back pressed against the floor. Your arms should be lying across your sides with the palms facing down.', 'Your legs should be touching each other. Slowly elevate your legs up in the air until they are almost perpendicular to the floor with a slight bend at the knees. Your feet should be parallel to the floor.', 'Move your arms so that they are fully extended at a 45 degree angle from the floor. This is the starting position.', 'While keeping your lower back pressed against the floor, slowly lift your torso and use your hands to try and touch your toes. Remember to exhale while perform this part of the exercise.', 'Slowly begin to lower your torso and arms back down to the starting position while inhaling. Remember to keep your arms straight out pointing towards your toes.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'toe-touchers';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Toe_Touchers/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Toe_Touchers/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Triceps Stretch', 'triceps-stretch', NULL, v_category_id, 'mobility', 'isolation', 'static', 'beginner', ARRAY['Reach your hand behind your head, grasp your elbow and gently pull. Hold for 10 to 20 seconds, then switch sides.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'triceps-stretch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Triceps_Stretch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Triceps_Stretch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'stretching';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Wrist Circles', 'wrist-circles', NULL, v_category_id, 'mobility', 'isolation', 'pull', 'beginner', ARRAY['Start by standing straight with your feet being shoulder width apart from each other. Elevate your arms to the side of you until they are fully extended and parallel to the floor at a height that is evenly aligned with your shoulders. Tip: Your torso and arms should form the letter "T: Your palms should be facing down. This is the starting position.', 'Keeping your entire body stationary except for the wrists, begin to rotate both wrists forward in a circular motion. Tip: Pretend that you are trying to draw circles by using your hands as the brush. Breathe normally as you perform this exercise.', 'Repeat for the recommended amount of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'wrist-circles';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Wrist_Circles/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Wrist_Circles/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Alternate Leg Diagonal Bound', 'alternate-leg-diagonal-bound', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Assume a comfortable stance with one foot slightly in front of the other.', 'Begin by pushing off with the front leg, driving the opposite knee forward and as high as possible before landing. Attempt to cover as much distance to each side with each bound.', 'It may help to use a line on the ground to guage distance from side to side.', 'Repeat the sequence with the other leg.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'alternate-leg-diagonal-bound';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternate_Leg_Diagonal_Bound/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Alternate_Leg_Diagonal_Bound/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Backward Medicine Ball Throw', 'backward-medicine-ball-throw', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['This exercise is best done with a partner. If you lack a partner, the ball can be thrown and retrieved or thrown against a wall.', 'Begin standing a few meters in front of your partner, both facing the same direction. Begin holding the ball between your legs.', 'Squat down and then forcefully reverse direction, coming to full extension and you toss the ball over your head to your partner.', 'Your partner can then roll the ball back to you. Repeat for the desired number of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'backward-medicine-ball-throw';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Medicine Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Backward_Medicine_Ball_Throw/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Backward_Medicine_Ball_Throw/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bench Jump', 'bench-jump', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Begin with a box or bench 1-2 feet in front of you. Stand with your feet shoulder width apart. This will be your starting position.', 'Perform a short squat in preparation for the jump; swing your arms behind you.', 'Rebound out of this position, extending through the hips, knees, and ankles to jump as high as possible. Swing your arms forward and up.', 'Jump over the bench, landing with the knees bent, absorbing the impact through the legs.', 'Turn around and face the opposite direction, then jump back over the bench.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bench-jump';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Jump/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Jump/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bench Sprint', 'bench-sprint', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Stand on the ground with one foot resting on a bench or box with your heel close to the edge.', 'Push off with your foot on top of the bench, extending through the hip and knee.', 'Land with the opposite foot on top of the box, returning your other foot back to the start position.', 'Continue alternating from one foot to another to complete the set.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bench-sprint';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Sprint/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Sprint/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Box Jump (Multiple Response)', 'box-jump-multiple-response', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Assume a relaxed stance facing the box or platform approximately an arm''s length away. Arms should be down at the sides and legs slightly bent.', 'Using the arms to aid in the initial burst, jump upward and forward, landing with feet simultaneously on top of the box or platform.', 'Immediately drop or jump back down to the original starting place; then repeat the sequence.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'box-jump-multiple-response';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Box_Jump_Multiple_Response/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Box_Jump_Multiple_Response/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Box Skip', 'box-skip', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['You will need several boxes lined up about 8 feet apart.', 'Begin facing the first box with one leg slightly behind the other.', 'Drive off the back leg, attempting to gain as much height with the hips as possible.', 'Immediately upon landing on the box, drive the other leg forward and upward to gain height and distance, leaping from the box. Land between the first two boxes with the same leg that landed on the first box.', 'Then, step to the next box and repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'box-skip';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Box_Skip/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Box_Skip/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Catch and Overhead Throw', 'catch-and-overhead-throw', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Begin standing while facing a wall or a partner.', 'Using both hands, position the ball behind your head, stretching as much as possible, and forcefully throw the ball forward.', 'Ensure that you follow your throw through, being prepared to receive your rebound from your throw. If you are throwing against the wall, make sure that you stand close enough to the wall to receive the rebound, and aim a little higher than you would with a partner.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'catch-and-overhead-throw';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Medicine Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Catch_and_Overhead_Throw/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Catch_and_Overhead_Throw/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chest Push (multiple response)', 'chest-push-multiple-response', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Begin in a kneeling position facing a wall or utilize a partner. Hold the ball with both hands tight into the chest.', 'Execute the pass by exploding forward and outward with the hips while pushing the ball as hard as possible.', 'Follow through by falling forward, catching yourself with your hands.', 'Immediately return to an upright position. Repeat for the desired number of repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chest-push-multiple-response';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Medicine Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_Push_multiple_response/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_Push_multiple_response/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chest Push (single response)', 'chest-push-single-response', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Begin in a kneeling position holding the medicine ball with both hands tightly into the chest.', 'Execute the pass by exploding forward and outward with the hips while pushing the ball as far as possible.', 'Follow through by falling forward, catching yourself with your hands.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chest-push-single-response';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Medicine Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_Push_single_response/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_Push_single_response/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chest Push from 3 point stance', 'chest-push-from-3-point-stance', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Begin in a three point stance, squatted down with your back flat and one hand on the ground. Place the medicine ball directly in front of you.', 'To begin, take your first step as you pull the ball to your chest, positioning both hands to prepare for the throw.', 'As you execute the second step, explosively release the ball forward as hard as possible.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chest-push-from-3-point-stance';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Medicine Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_Push_from_3_point_stance/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_Push_from_3_point_stance/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chest Push with Run Release', 'chest-push-with-run-release', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Begin in an athletic stance with the knees bent, hips back, and back flat. Hold the medicine ball near your legs. This will be your starting position.', 'While taking your first step draw the medicine ball into your chest.', 'As you take the second step, explosively push the ball forward, immediately sprinting for 10 yards after the release. If you are really fast, you can catch your own pass!']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chest-push-with-run-release';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Medicine Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_Push_with_Run_Release/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chest_Push_with_Run_Release/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Depth Jump Leap', 'depth-jump-leap', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['For this drill you will need two boxes or benches, one 12 to 16 inches high and the other 22 to 26 inches high.', 'Stand on one of the two boxes with arms at the sides; feet should be together and slightly off the edge as in the depth jump. Place the other box approximately two or three feet in front of and facing the performer.', 'Begin by dropping off the initial box, landing and simultaneously taking off with both feet.', 'Rebound by driving upward and outward as intensely as possible, using the arms and full extension of the body to jump onto the higher box. Again, allow the legs to absorb the impact.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'depth-jump-leap';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Depth_Jump_Leap/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Depth_Jump_Leap/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Double Leg Butt Kick', 'double-leg-butt-kick', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Begin standing with your knees slightly bent.', 'Quickly squat a short distance, flexing the hips and knees, and immediately extend to jump for maximum vertical height.', 'As you go up, tuck your heels by flexing the knees, attempting to touch the buttocks.', 'Finish the motion by landing with the knees only partially bent, using your legs to absorb the impact.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'double-leg-butt-kick';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Double_Leg_Butt_Kick/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Double_Leg_Butt_Kick/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Drop Push', 'drop-push', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Position low boxes or other platforms 2-3 feet apart.', 'Move to a pushup position between them, supporting yourself by placing your hands on the boxes.', 'With good posture, drop from the platforms by pressing up and moving your hands to shoulder width, cushioning your landing by absorbing the impact through the arm.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'drop-push';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Drop_Push/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Drop_Push/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Seated Box Jump', 'dumbbell-seated-box-jump', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Position a box a couple feet to the side of a bench. Hold a dumbbell to your chest with both hands and seat yourself on the bench facing the box. This will be your starting position.', 'Plant your feet firmly on the ground as you lean forward, extending through the hips and knees to jump up and forward.', 'Land on the box with both feet, absorbing the impact by allowing the hips and knees to bend.', 'Step down and return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-seated-box-jump';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Seated_Box_Jump/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Seated_Box_Jump/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Fast Skipping', 'fast-skipping', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Start in a relaxed position with one leg slightly forward. This will be your starting position.', 'Skip by executing a step-hop pattern of right-right-step to left-left-step, and so on, alternating back and forth.', 'Perform fast skips by maintaining close contact with the ground and reduce air time, moving as quickly as possible.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'fast-skipping';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Fast_Skipping/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Fast_Skipping/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Box Jump', 'front-box-jump', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Begin with a box of an appropriate height 1-2 feet in front of you. Stand with your feet should width apart. This will be your starting position.', 'Perform a short squat in preparation for jumping, swinging your arms behind you.', 'Rebound out of this position, extending through the hips, knees, and ankles to jump as high as possible. Swing your arms forward and up.', 'Land on the box with the knees bent, absorbing the impact through the legs. You can jump from the box back to the ground, or preferably step down one leg at a time.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-box-jump';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Box_Jump/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Box_Jump/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Front Cone Hops (or hurdle hops)', 'front-cone-hops-or-hurdle-hops', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Set up a row of cones or other small barriers, placing them a few feet apart.', 'Stand in front of the first cone with your feet shoulder width apart. This will be your starting position.', 'Begin by jumping with both feet over the first cone, swinging both arms as you jump.', 'Absorb the impact of landing by bending the knees, rebounding out of the first leap by jumping over the next cone.', 'Continue until you have jumped over all of the cones.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'front-cone-hops-or-hurdle-hops';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Cone_Hops_or_hurdle_hops/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Front_Cone_Hops_or_hurdle_hops/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Heavy Bag Thrust', 'heavy-bag-thrust', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Utilize a heavy bag for this exercise. Assume an upright stance next to the bag, with your feet staggered, fairly wide apart. Place your hand on the bag at about chest height. This will be your starting position.', 'Begin by twisting at the waist, pushing the bag forward as hard as possible. Perform this move quickly, pushing the bag away from your body.', 'Receive the bag as it swings back by reversing these steps.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'heavy-bag-thrust';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Heavy_Bag_Thrust/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Heavy_Bag_Thrust/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hurdle Hops', 'hurdle-hops', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Set up a row of hurdles or other small barriers, placing them a few feet apart.', 'Stand in front of the first hurdle with your feet shoulder width apart. This will be your starting position.', 'Begin by jumping with both feet over the first hurdle, swinging both arms as you jump.', 'Absorb the impact of landing by bending the knees, rebounding out of the first leap by jumping over the next hurdle. Continue until you have jumped over all of the hurdles.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hurdle-hops';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hurdle_Hops/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hurdle_Hops/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Incline Push-Up Depth Jump', 'incline-push-up-depth-jump', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['For this drill you will need a box about 12 inches high, and two thick mats or aerobics steps.', 'Place the steps just outside of your shoulders, and place your feet on top of the box so that you are in an incline pushup position, your hands just inside the steps. This will be your starting position.', 'Begin by bending at the elbows to lower your body, quickly reversing position to push your body off of the ground. As you leave the ground, move your hands onto the steps, bending your elbows to absorb the impact.', 'Repeat the motion to return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'incline-push-up-depth-jump';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Incline_Push-Up_Depth_Jump/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Incline_Push-Up_Depth_Jump/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Isometric Chest Squeezes', 'isometric-chest-squeezes', NULL, v_category_id, 'strength', 'compound', 'static', 'beginner', ARRAY['While either seating or standing, bend your arms at a 90-degree angle and place the palms of your hands together in front of your chest. Tip: Your hands should be open with the palms together and fingers facing forward (perpendicular to your torso).', 'Push both hands against each other as you contract your chest. Start with slow tension and increase slowly. Keep breathing normally as you execute this contraction.', 'Hold for the recommended number of seconds.', 'Now release the tension slowly.', 'Rest for the recommended amount of time and repeat.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'isometric-chest-squeezes';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Isometric_Chest_Squeezes/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Isometric_Chest_Squeezes/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Knee Tuck Jump', 'knee-tuck-jump', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Begin in a comfortable standing position with your knees slightly bent. Hold your hands in front of you, palms down with your fingertips together at chest height. This will be your starting position.', 'Rapidly dip down into a quarter squat and immediately explode upward. Drive the knees towards the chest, attempting to touch them to the palms of the hands.', 'Jump as high as you can, raising your knees up, and then ensure a good land be re-extending your legs, absorbing impact through be allowing the knees to rebend.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'knee-tuck-jump';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Knee_Tuck_Jump/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Knee_Tuck_Jump/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Lateral Bound', 'lateral-bound', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Assume a half squat position facing 90 degrees from your direction of travel. This will be your starting position.', 'Allow your lead leg to do a countermovement inward as you shift your weight to the outside leg.', 'Immediately push off and extend, attempting to bound to the side as far as possible.', 'Upon landing, immediately push off in the opposite direction, returning to your original start position.', 'Continue back and forth for several repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'lateral-bound';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Bodyweight' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Lateral_Bound/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Lateral_Bound/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Lateral Box Jump', 'lateral-box-jump', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Assume a comfortable standing position, with a short box positioned next to you. This will be your starting position.', 'Quickly dip into a quarter squat to initiate the stretch reflex, and immediately reverse direction to jump up and to the side.', 'Bring your knees high enough to ensure your feet have good clearance over the box.', 'Land on the center of the box, using your legs to absorb the impact.', 'Carefully jump down to the other side of the box, and continue going back and forth for several repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'lateral-box-jump';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Lateral_Box_Jump/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Lateral_Box_Jump/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Lateral Cone Hops', 'lateral-cone-hops', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Position a number of cones in a row several feet apart.', 'Stand next to the end of the cones, facing 90 degrees to the direction of travel. This will be your starting position.', 'Begin the jump by dipping with the knees to initiate a stretch reflex, and immediately reverse direction to push off the ground, jumping up and sideways over the cone.', 'Use your legs to absorb impact upon landing, and rebound into the next jump, continuing down the row of cones.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'lateral-cone-hops';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Lateral_Cone_Hops/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Lateral_Cone_Hops/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Linear 3-Part Start Technique', 'linear-3-part-start-technique', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['This drill helps you accelerate as quickly as possible into a sprint from a dead stop. It helps to use a line to start from. Begin with two feet on the line. Place your left foot with the toe next to your right ankle. Place your right foot 4-6 inches behind the left.', 'Place your right hand onto the line, and thing bring your nose close to your left knee.', 'Squat down as you lean foward, your head being lower than your hips and your weight loaded onto the left leg. This will be your starting position.', 'Take your left hand up so that it is parallel to the ground, pointing behind you, and explode out when ready.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'linear-3-part-start-technique';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Linear_3-Part_Start_Technique/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Linear_3-Part_Start_Technique/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Linear Depth Jump', 'linear-depth-jump', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['You will need two boxes or benches spaced a few feet away from each other. Begin by standing on one box facing towards the other platform.', 'To initiate the movement, gently drop down to the ground between your platforms, allowing the knees and hips to flex.', 'Reverse the motion by exploding, extending through the hips, knees, and ankles to jump onto the other platform.', 'Land softly, asborbing the impact through the legs.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'linear-depth-jump';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Linear_Depth_Jump/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Linear_Depth_Jump/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Medicine Ball Chest Pass', 'medicine-ball-chest-pass', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['You will need a partner for this exercise. Lacking one, this movement can be performed against a wall.', 'Begin facing your partner holding the medicine ball at your torso with both hands.', 'Pull the ball to your chest, and reverse the motion by extending through the elbows. For sports applications, you can take a step as you throw.', 'Your partner should catch the ball, and throw it back to you.', 'Receive the throw with both hands at chest height.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'medicine-ball-chest-pass';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Medicine Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Medicine_Ball_Chest_Pass/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Medicine_Ball_Chest_Pass/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'plyometrics';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Medicine Ball Full Twist', 'medicine-ball-full-twist', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['For this exercise you will need a medicine ball and a partner. Stand back to back with your partner, spaced 2-3 feet apart. This will be your starting position.', 'Hold the ball in front of the trunk. Open the hips and turn the shoulders at the same time as your partner.', 'For full rotation, you and your partner should twist in the same direction, i.e. counter-clockwise.', 'Pass the ball to your partner, and both of you can now twist in the opposite direction to repeat the procedure.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'medicine-ball-full-twist';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Medicine Ball' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Medicine_Ball_Full_Twist/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Medicine_Ball_Full_Twist/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Band Good Morning', 'band-good-morning', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Using a 41 inch band, stand on one end, spreading your feet a small amount. Bend at the hips to loop the end of the band behind your neck. This will be your starting position.', 'Keeping your legs straight, extend through the hips to come to a near vertical position.', 'Ensure that you do not round your back as you go down back to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'band-good-morning';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Resistance Band' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Band_Good_Morning/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Band_Good_Morning/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Band Good Morning (Pull Through)', 'band-good-morning-pull-through', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Loop the band around a post. Standing a little ways away, loop the opposite end around the neck. Your hands can help hold the band in position.', 'Begin by bending at the hips, getting your butt back as far as possible. Keep your back flat and bend forward to about 90 degrees. Your knees should be only slightly bent.', 'Return to the starting position be driving through with the hips to come back to a standing position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'band-good-morning-pull-through';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Resistance Band' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Band_Good_Morning_Pull_Through/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Band_Good_Morning_Pull_Through/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Glute Bridge', 'barbell-glute-bridge', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Begin seated on the ground with a loaded barbell over your legs. Using a fat bar or having a pad on the bar can greatly reduce the discomfort caused by this exercise. Roll the bar so that it is directly above your hips, and lay down flat on the floor.', 'Begin the movement by driving through with your heels, extending your hips vertically through the bar. Your weight should be supported by your upper back and the heels of your feet.', 'Extend as far as possible, then reverse the motion to return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-glute-bridge';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Glute_Bridge/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Glute_Bridge/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Barbell Hip Thrust', 'barbell-hip-thrust', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Begin seated on the ground with a bench directly behind you. Have a loaded barbell over your legs. Using a fat bar or having a pad on the bar can greatly reduce the discomfort caused by this exercise.', 'Roll the bar so that it is directly above your hips, and lean back against the bench so that your shoulder blades are near the top of it.', 'Begin the movement by driving through your feet, extending your hips vertically through the bar. Your weight should be supported by your shoulder blades and your feet. Extend as far as possible, then reverse the motion to return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'barbell-hip-thrust';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Hip_Thrust/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Barbell_Hip_Thrust/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bench Press - Powerlifting', 'bench-press-powerlifting', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Begin by lying on the bench, getting your head beyond the bar if possible. Tuck your feet underneath you and arch your back. Using the bar to help support your weight, lift your shoulder off the bench and retract them, squeezing the shoulder blades together. Use your feet to drive your traps into the bench. Maintain this tight body position throughout the movement.', 'However wide your grip, it should cover the ring on the bar. Pull the bar out of the rack without protracting your shoulders. Focus on squeezing the bar and trying to pull it apart.', 'Lower the bar to your lower chest or upper stomach. The bar, wrist, and elbow should stay in line at all times.', 'Pause when the barbell touches your torso, and then drive the bar up with as much force as possible. The elbows should be tucked in until lockout.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bench-press-powerlifting';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Press_-_Powerlifting/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Press_-_Powerlifting/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bench Press with Chains', 'bench-press-with-chains', NULL, v_category_id, 'strength', 'compound', 'push', 'advanced', ARRAY['Adjust the leader chain, shortening it to the desired length.Place the chains on the sleeves of the bar.', 'Lying on the bench, get your head beyond the bar if possible. Tuck your feet underneath you and arch your back. Using the bar to help support your weight, lift your shoulder off the bench and retract them, squeezing the shoulder blades together. Use your feet to drive your traps into the bench. Maintain this tight body position throughout the movement. However wide your grip, it should cover the ring on the bar.', 'Pull the bar out of the rack without protracting your shoulders. Focus on squeezing the bar and trying to pull it apart. Lower the bar to your lower chest or upper stomach. The bar, wrist, and elbow should stay in line at all times.', 'Pause when the barbell touches your torso, and then drive the bar up with as much force as possible. The elbows should be tucked in until lockout.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bench-press-with-chains';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Press_with_Chains/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bench_Press_with_Chains/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Board Press', 'board-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Begin by lying on the bench, getting your head beyond the bar if possible. One to five boards, made out of 2x6''s, can be screwed together and held in place by a training partner, bands, or just tucked under your shirt.', 'Tuck your feet underneath you and arch your back. Using the bar to help support your weight, lift your shoulder off the bench and retract them, squeezing the shoulder blades together. Use your feet to drive your traps into the bench. Maintain this tight body position throughout the movement.', 'You can take a standard bench grip, or shoulder width to focus on the triceps. Pull the bar out of the rack without protracting your shoulders. The bar, wrist, and elbow should stay in line at all times. Focus on squeezing the bar and trying to pull it apart.', 'Lower the bar to the boards, and then drive the bar up with as much force as possible. The elbows should be tucked in until lockout.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'board-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lats' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Board_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Board_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Box Squat', 'box-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['The box squat allows you to squat to desired depth and develop explosive strength in the squat movement. Begin in a power rack with a box at the appropriate height behind you. Typically, you would aim for a box height that brings you to a parallel squat, but you can train higher or lower if desired.', 'Begin by stepping under the bar and placing it across the back of the shoulders. Squeeze your shoulder blades together and rotate your elbows forward, attempting to bend the bar across your shoulders. Remove the bar from the rack, creating a tight arch in your lower back, and step back into position. Place your feet wider for more emphasis on the back, glutes, adductors, and hamstrings, or closer together for more quad development. Keep your head facing forward.', 'With your back, shoulders, and core tight, push your knees and butt out and you begin your descent. Sit back with your hips until you are seated on the box. Ideally, your shins should be perpendicular to the ground. Pause when you reach the box, and relax the hip flexors. Never bounce off of a box.', 'Keeping the weight on your heels and pushing your feet and knees out, drive upward off of the box as you lead the movement with your head. Continue upward, maintaining tightness head to toe.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'box-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Box_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Box_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Box Squat with Bands', 'box-squat-with-bands', NULL, v_category_id, 'strength', 'compound', 'push', 'advanced', ARRAY['Begin in a power rack with a box at the appropriate height behind you. Set up the bands on the sleeves, secured to either band pegs, the rack, or dumbbells so that there is appropriate tension. If dumbbells are used, secure them so that they don''t move. Also, ensure that the dumbbells you are using are heavy enough for the bands that you are using. Additional plates can be used to hold the dumbbells down. If more tension is needed, you can either widen the base on the floor or choke the bands. Typically, you would aim for a box height that brings you to a parallel squat, but you can train higher or lower if desired.', 'Begin by stepping under the bar and placing it across the back of the shoulders. Squeeze your shoulder blades together and rotate your elbows forward, attempting to bend the bar across your shoulders. Remove the bar from the rack, creating a tight arch in your lower back, and step back into position. Place your feet wider for more emphasis on the back, glutes, adductors, and hamstrings, or closer together for more quad development. Keep your head facing forward.', 'With your back, shoulders, and core tight, push your knees and butt out and you begin your descent. Sit back with your hips until you are seated on the box. Ideally, your shins should be perpendicular to the ground. Pause when you reach the box, and relax the hip flexors. Never bounce off of a box.', 'Keeping the weight on your heels and pushing your feet and knees out, drive upward off of the box as you lead the movement with your head. Continue upward, maintaining tightness head to toe. Use care to return the barbell to the rack.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'box-squat-with-bands';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Box_Squat_with_Bands/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Box_Squat_with_Bands/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chain Handle Extension', 'chain-handle-extension', NULL, v_category_id, 'strength', 'isolation', 'push', 'intermediate', ARRAY['You will need two cable handle attachments and a flat bench, as well as chains, for this exercise. Clip the middle of the chains to the handles, and position yourself on the flat bench. Your elbows should be pointing straight up.', 'Begin by extending through the elbow, keeping your upper arm still, with your wrists pronated.', 'Pause at the lockout, and reverse the motion to return to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chain-handle-extension';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chain_Handle_Extension/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chain_Handle_Extension/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Chain Press', 'chain-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Begin by connecting the chains to the cable handle attachments. Position yourself on the flat bench in the same position as for a dumbbell press. Your wrists should be pronated and arms perpendicular to the floor. This will be your starting position.', 'Lower the chains by flexing the elbows, unloading some of the chain onto the floor.', 'Continue until your elbow forms a 90 degree angle, and then reverse the motion by extending through the elbow to lockout.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'chain-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chain_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Chain_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Deadlift with Bands', 'deadlift-with-bands', NULL, v_category_id, 'strength', 'compound', 'pull', 'advanced', ARRAY['To deadlift with short bands, simply loop them over the bar before you start, and step into them to set up. For long bands, they will need to be anchored to a secure base, such as heavy dumbbells or a rack.', 'With your feet, and your grip set, take a big breath and then lower your hips and bend the knees until your shins contact the bar. Look forward with your head, keep your chest up and your back arched, and begin driving through the heels to move the weight upward. After the bar passes the knees, aggressively pull the bar back, pulling your shoulder blades together as you drive your hips forward into the bar.', 'Lower the bar by bending at the hips and guiding it to the floor.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'deadlift-with-bands';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Deadlift_with_Bands/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Deadlift_with_Bands/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Deadlift with Chains', 'deadlift-with-chains', NULL, v_category_id, 'strength', 'compound', 'pull', 'advanced', ARRAY['You can attach the chains to the sleeves of the bar, or just drape the middle over the bar so there is a greater weight increase as you lift.', 'Approach the bar so that it is centered over your feet. You feet should be about hip width apart. Bend at the hip to grip the bar at shoulder width, allowing your shoulder blades to protract. Typically, you would use an overhand grip or an over/under grip on heavier sets. With your feet, and your grip set, take a big breath and then lower your hips and bend the knees until your shins contact the bar.', 'Look forward with your head, keep your chest up and your back arched, and begin driving through the heels to move the weight upward. After the bar passes the knees, aggressively pull the bar back, pulling your shoulder blades together as you drive your hips forward into the bar.', 'Lower the bar by bending at the hips and guiding it to the floor.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'deadlift-with-chains';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Deadlift_with_Chains/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Deadlift_with_Chains/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Deficit Deadlift', 'deficit-deadlift', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Begin by having a platform or weight plates that you can stand on, usually 1-3 inches in height. Approach the bar so that it is centered over your feet. You feet should be about hip width apart. Bend at the hip to grip the bar at shoulder width, allowing your shoulder blades to protract. Typically, you would use an overhand grip or an over/under grip on heavier sets.', 'With your feet, and your grip set, take a big breath and then lower your hips and bend the knees until your shins contact the bar. Look forward with your head, keep your chest up and your back arched, and begin driving through the heels to move the weight upward. After the bar passes the knees, aggressively pull the bar back, pulling your shoulder blades together as you drive your hips forward into the bar.', 'Lower the bar by bending at the hips and guiding it to the floor.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'deficit-deadlift';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Deficit_Deadlift/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Deficit_Deadlift/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Dumbbell Floor Press', 'dumbbell-floor-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Lay on the floor holding dumbbells in your hands. Your knees can be bent. Begin with the weights fully extended above you.', 'Lower the weights until your upper arm comes in contact with the floor. You can tuck your elbows to emphasize triceps size and strength, or to focus on your chest angle your arms to the side.', 'Pause at the bottom, and then bring the weight together at the top by extending through the elbows.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'dumbbell-floor-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Dumbbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Floor_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Dumbbell_Floor_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Floor Press', 'floor-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Adjust the j-hooks so they are at the appropriate height to rack the bar. Begin lying on the floor with your head near the end of a power rack. Keeping your shoulder blades pulled together; pull the bar off of the hooks.', 'Lower the bar towards the bottom of your chest or upper stomach, squeezing the bar and attempting to pull it apart as you do so. Ensure that you tuck your elbows throughout the movement. Lower the bar until your upper arm contacts the ground and pause, preventing any slamming or bouncing of the weight.', 'Press the bar back up as fast as you can, keeping the bar, your wrists, and elbows in line as you do so.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'floor-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Floor_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Floor_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Floor Press with Chains', 'floor-press-with-chains', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Adjust the j-hooks so they are at the appropriate height to rack the bar. For this exercise, drape the chains directly over the end of the bar, trying to keep the ends away from the plates.', 'Begin lying on the floor with your head near the end of a power rack. Keeping your shoulder blades pulled together, pull the bar off of the hooks.', 'Lower the bar towards the bottom of your chest or upper stomach, squeezing the bar and attempting to pull it apart as you do so. Ensure that you tuck your elbows throughout the movement. Lower the bar until your upper arm contacts the ground and pause, preventing any slamming or bouncing of the weight.', 'Press the bar back up as fast as you can, keeping the bar, your wrists, and elbows in line as you do so.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'floor-press-with-chains';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Floor_Press_with_Chains/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Floor_Press_with_Chains/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Glute Ham Raise', 'glute-ham-raise', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Begin by adjusting the equipment to fit your body. Place your feet against the footplate in between the rollers as you lie facedown. Your knees should be just behind the pad.', 'Start from the bottom of the movement. Keep your back arched as you begin the movement by flexing the knees. Drive your toes into the foot plate as you do so. Keep your upper body straight, and continue until your body is upright.', 'Return to the starting position, keeping your descent under control.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'glute-ham-raise';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Machine' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Glute_Ham_Raise/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Glute_Ham_Raise/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Good Morning', 'good-morning', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Begin with a bar on a rack at shoulder height. Rack the bar across the rear of your shoulders as you would a power squat, not on top of your shoulders. Keep your back tight, shoulder blades pinched together, and your knees slightly bent. Step back from the rack.', 'Begin by bending at the hips, moving them back as you bend over to near parallel. Keep your back arched and your cervical spine in proper alignment.', 'Reverse the motion by extending through the hips with your glutes and hamstrings. Continue until you have returned to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'good-morning';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Good_Morning/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Good_Morning/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'powerlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Good Morning off Pins', 'good-morning-off-pins', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Begin with a bar on a rack at about the same height as your stomach. Bend over underneath the bar and rack the bar across the rear of your shoulders as you would a power squat, not on top of your shoulders. At the proper height, you should be near parallel to the floor when bent over. Keep your back tight, shoulder blades pinched together, and your knees slightly bent. Keep your back arched and your cervical spine in proper alignment.', 'Begin the motion by extending through the hips with your glutes and hamstrings, and you are standing with the weight. Slowly lower the weight back to the pins returning to the starting position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'good-morning-off-pins';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Good_Morning_off_Pins/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Good_Morning_off_Pins/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Clean', 'clean', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['With a barbell on the floor close to the shins, take an overhand (or hook) grip just outside the legs. Lower your hips with the weight focused on the heels, back straight, head facing forward, chest up, with your shoulders just in front of the bar. This will be your starting position.', '', 'Begin the first pull by driving through the heels, extending your knees. Your back angle should stay the same, and your arms should remain straight. Move the weight with control as you continue to above the knees.', 'Next comes the second pull, the main source of acceleration for the clean. As the bar approaches the mid-thigh position, begin extending through the hips. In a jumping motion, accelerate by extending the hips, knees, and ankles, using speed to move the bar upward. There should be no need to actively pull through the arms to accelerate the weight; at the end of the second pull, the body should be fully extended, leaning slightly back, with the arms still extended.', 'As full extension is achieved, transition into the third pull by aggressively shrugging and flexing the arms with the elbows up and out. At peak extension, aggressively pull yourself down, rotating your elbows under the bar as you do so. Receive the bar in a front squat position, the depth of which is dependent upon the height of the bar at the end of the third pull. The bar should be racked onto the protracted shoulders, lightly touching the throat with the hands relaxed. Continue to descend to the bottom squat position, which will help in the recovery.', 'Immediately recover by driving through the heels, keeping the torso upright and elbows up. Continue until you have risen to a standing position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'clean';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Clean Deadlift', 'clean-deadlift', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Begin standing with a barbell close to your shins. Your feet should be directly under your hips with your feet turned out slightly. Grip the bar with a double overhand grip or hook grip, about shoulder width apart. Squat down to the bar. Your spine should be in full extension, with a back angle that places your shoulders in front of the bar and your back as vertical as possible.', 'Begin by driving through the floor through the front of your heels. As the bar travels upward, maintain a constant back angle. Flare your knees out to the side to help keep them out of the bar''s path.', 'After the bar crosses the knees, complete the lift by driving the hips into the bar until your hips and knees are extended.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'clean-deadlift';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_Deadlift/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_Deadlift/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Clean Pull', 'clean-pull', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['With a barbell on the floor close to the shins, take an overhand or hook grip just outside the legs. Lower your hips with the weight focused on the heels, back straight, head facing forward, chest up, with your shoulders just in front of the bar. This will be your starting position.', 'Begin the first pull by driving through the heels, extending your knees. Your back angle should stay the same, and your arms should remain straight and elbows out. Move the weight with control as you continue to above the knees.', 'Next comes the second pull, the main source of acceleration for the clean. As the bar approaches the mid-thigh position, begin extending through the hips. In a jumping motion, accelerate by extending the hips, knees, and ankles, using speed to move the bar upward. There should be no need to actively pull through the arms to accelerate the weight; at the end of the second pull, the body should be fully extended, leaning slightly back, with the arms still extended. Full extension should be violent and abrupt, and ensure that you do not prolong the extension for longer than necessary.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'clean-pull';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_Pull/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_Pull/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Clean Shrug', 'clean-shrug', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Begin with a shoulder width, double overhand or hook grip, with the bar hanging at the mid thigh position. Your back should be straight and inclined slightly forward.', 'Shrug your shoulders towards your ears. While this exercise can usually by loaded with heavier weight than a clean, avoid overloading to the point that the execution slows down.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'clean-shrug';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_Shrug/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_Shrug/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Clean and Jerk', 'clean-and-jerk', NULL, v_category_id, 'strength', 'compound', 'push', 'advanced', ARRAY['With a barbell on the floor close to the shins, take an overhand or hook grip just outside the legs. Lower your hips with the weight focused on the heels, back straight, head facing forward, chest up, with your shoulders just in front of the bar. This will be your starting position.', 'Begin the first pull by driving through the heels, extending your knees. Your back angle should stay the same, and your arms should remain straight. Move the weight with control as you continue to above the knees.', 'Next comes the second pull, the main source of acceleration for the clean. As the bar approaches the mid-thigh position, begin extending through the hips. In a jumping motion, accelerate by extending the hips, knees, and ankles, using speed to move the bar upward. There should be no need to actively pull through the arms to accelerate the weight; at the end of the second pull, the body should be fully extended, leaning slightly back, with the arms still extended.', 'As full extension is achieved, transition into the third pull by aggressively shrugging and flexing the arms with the elbows up and out. At peak extension, aggressively pull yourself down, rotating your elbows under the bar as you do so. Receive the bar in a front squat position, the depth of which is dependent upon the height of the bar at the end of the third pull. The bar should be racked onto the protracted shoulders, lightly touching the throat with the hands relaxed. Continue to descend to the bottom squat position, which will help in the recovery.', 'Immediately recover by driving through the heels, keeping the torso upright and elbows up. Continue until you have risen to a standing position.', 'The second phase is the jerk, which raises the weight overhead. Standing with the weight racked on the front of the shoulders, begin with the dip. With your feet directly under your hips, flex the knees without moving the hips backward. Go down only slightly, and reverse direction as powerfully as possible.', 'Drive through the heels create as much speed and force as possible, and be sure to move your head out of the way as the bar leaves the shoulders.', 'At this moment as the feet leave the floor, the feet must be placed into the receiving position as quickly as possible. In the brief moment the feet are not actively driving against the platform, the athletes effort to push the bar up will drive them down. The feet should be split, with one foot forward, and one foot back. Receive the bar with the arms locked out overhead. Return to a standing position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'clean-and-jerk';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_and_Jerk/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_and_Jerk/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Clean from Blocks', 'clean-from-blocks', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['With a barbell on boxes or stands of the desired height, take an overhand or hook grip just outside the legs. Lower your hips with the weight focused on the heels, back straight, head facing forward, chest up, with your shoulders just in front of the bar. This will be your starting position.', 'Begin the first pull by driving through the heels, extending your knees. Your back angle should stay the same, and your arms should remain straight with the elbows pointed out.', 'As full extension is achieved, transition into the receiving position by aggressively shrugging and flexing the arms with the elbows up and out. Aggressively pull yourself down, rotating your elbows under the bar as you do so. Receive the bar in a front squat position, the depth of which is dependent upon the height of the bar at the end of the third pull. The bar should be racked onto the protracted shoulders, lightly touching the throat with the hands relaxed. Continue to descend to the bottom squat position, which will help in the recovery.', 'Immediately recover by driving through the heels, keeping the torso upright and elbows up. Continue until you have risen to a standing position. Return the weight to the boxes for the next rep.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'clean-from-blocks';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_from_Blocks/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Clean_from_Blocks/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Frankenstein Squat', 'frankenstein-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['This drill teaches you the proper positioning of both the bar and your body during the clean and front squat.', 'Place the barbell on the front of the shoulders, releasing your grip and extending your arms out in front of you. The shoulders should be pushed forward to create a shelf, and the bar should be in contact with the throat. Ensure that you only move your shoulder blades forward; don''t round the thoracic spine.', 'Squat by flexing the knees and hips, sitting in between your legs. Keep the torso upright, the arms up, and the shoulders forward, and the bar should stay in place. Go to the bottom of the squat, until your hamstrings contact your calves.', 'Return to the upright position by driving through the front of the heel and extending the knees and hips.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'frankenstein-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Frankenstein_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Frankenstein_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hang Clean', 'hang-clean', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Begin with a shoulder width, double overhand or hook grip, with the bar hanging at the mid thigh position. Your back should be straight and inclined slightly forward.', 'Begin by aggressively extending through the hips, knees and ankles, driving the weight upward. As you do so, shrug your shoulders towards your ears.', 'Immediately recover by driving through the heels, keeping the torso upright and elbows up. Continue until you have risen to a standing position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hang-clean';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hang_Clean/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hang_Clean/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hang Clean - Below the Knees', 'hang-clean-below-the-knees', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Begin with a shoulder width, double overhand or hook grip, with the bar hanging just below the knees. Your back should be straight and inclined slightly forward.', 'Begin by aggressively extending through the hips, knees and ankles, driving the weight upward. As you do so, shrug your shoulders towards your ears. As full extension is achieved, transition into the third pull by aggressively shrugging and flexing the arms with the elbows up and out.', 'At peak extension, aggressively pull yourself down, rotating your elbows under the bar as you do so. Receive the bar in a front squat position, the depth of which is dependent upon the height of the bar at the end of the third pull. The bar should be racked onto the protracted shoulders, lightly touching the throat with the hands relaxed. Continue to descend to the bottom squat position, which will help in the recovery.', 'Immediately recover by driving through the heels, keeping the torso upright and elbows up. Continue until you have risen to a standing position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hang-clean-below-the-knees';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hang_Clean_-_Below_the_Knees/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hang_Clean_-_Below_the_Knees/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hang Snatch', 'hang-snatch', NULL, v_category_id, 'strength', 'compound', 'pull', 'advanced', ARRAY['Begin with a wide grip on the bar, with an overhand or hook grip. The feet should be directly below the hips with the feet turned out. Your knees should be slightly bent, and the torso inclined forward. The spine should be fully extended and the head facing forward. The bar should be at the hips. This will be your starting position.', 'Aggressively extend through the legs and hips. At peak extension, shrug the shoulders and allow the elbows to flex to the side.', 'As you move your feet into the receiving position, forcefully pull yourself below the bar as you elevate the bar overhead. Receive the bar with your body as low as possible and the arms fully extended overhead.', 'Return to a standing position with the weight overhead. Follow by returning the weight to the ground under control.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hang-snatch';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hang_Snatch/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hang_Snatch/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Hang Snatch - Below Knees', 'hang-snatch-below-knees', NULL, v_category_id, 'strength', 'compound', 'pull', 'advanced', ARRAY['Begin with a wide grip on the bar, with an overhand or hook grip. The feet should be directly below the hips with the feet turned out. Your knees should be slightly bent, and the torso inclined forward. The spine should be fully extended and the head facing forward. The bar should be just below the knees. This will be your starting position.', 'Aggressively extend through the legs and hips. At peak extension, shrug the shoulders and allow the elbows to flex to the side.', 'As you move your feet into the receiving position, forcefully pull yourself below the bar as you elevate the bar overhead. Receive the bar with your body as low as possible and the arms fully extended overhead.', 'Return to a standing position with the weight overhead, and then return the weight to the floor under control.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'hang-snatch-below-knees';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hang_Snatch_-_Below_Knees/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Hang_Snatch_-_Below_Knees/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Heaving Snatch Balance', 'heaving-snatch-balance', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['This drill helps you learn the snatch. Begin by holding a light weight across the back of the shoulders. Your feet should be slightly wider than hip width apart with the feet turned out, the same position that you would perform a squat with.', 'Begin by dipping with the knees slightly, and popping back up to briefly unload the bar. Drive yourself underneath the bar, elevating it overhead as you descend into a full squat.', 'Return to a standing position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'heaving-snatch-balance';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Heaving_Snatch_Balance/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Heaving_Snatch_Balance/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Jerk Balance', 'jerk-balance', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['This drill helps you learn to drive yourself low enough during the jerk and corrects those who move backward during the movement. Begin with the bar racked in the jerk position, with the shoulders forward, torso upright, and the feet split slightly apart.', 'Initiate the movement as you would a normal jerk, dipping at the knees while keeping your torso vertical, and driving back up forcefully, using momentum and not your arms to elevate the weight.', 'Keep the rear foot in place, using it to drive your body forward into a full split as you jerk the weight. Recover by standing up with the weight overhead.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'jerk-balance';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Jerk_Balance/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Jerk_Balance/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Jerk Dip Squat', 'jerk-dip-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['This movement strengthens the dip portion of the jerk. Begin with the bar racked in the jerk position, with the shoulders forward to create a shelf and the bar lightly contacting the throat. The feet should be directly under the hips, with the feet turned out as is comfortable.', 'Keeping the torso vertical, dip by flexing the knees, allowing them to travel forward and without moving the hips to the rear. The dip should not be excessive. Return the weight to the starting position by driving forcefully though the feet.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'jerk-dip-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Jerk_Dip_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Jerk_Dip_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'olympic weightlifting';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Kneeling Jump Squat', 'kneeling-jump-squat', NULL, v_category_id, 'strength', 'compound', 'push', 'advanced', ARRAY['Begin kneeling on the floor with a barbell racked across the back of your shoulders, or you can use your body weight for this exercise. This can be done inside of a power rack to make unracking easier.', 'Sit back with your hips until your glutes touch your feet, keeping your head and chest up.', 'Explode up with your hips, generating enough power to land with your feet flat on the floor.', 'Continue with the squat by driving through your heels and extending the knees to come to a standing position.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'kneeling-jump-squat';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Barbell' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Kneeling_Jump_Squat/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Kneeling_Jump_Squat/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strongman';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Atlas Stone Trainer', 'atlas-stone-trainer', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['This trainer is effective for developing Atlas Stone strength for those who don''t have access to stones, and are typically made from bar ends or heavy pipe.', 'Begin by loading the desired weight onto the bar. Straddle the weight, wrapping your arms around the implement, bending at the hips.', 'Begin by pulling the weight up past the knees, extending through the hips. As the weight clears the knees, it can be lapped by resting it on your thighs and sitting back, hugging it tightly to your chest.', 'Finish the movement by extending through your hips and knees to raise the weight as high as possible. The weight can be returned to the lap or to the ground for successive repetitions.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'atlas-stone-trainer';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Atlas_Stone_Trainer/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Atlas_Stone_Trainer/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strongman';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Atlas Stones', 'atlas-stones', NULL, v_category_id, 'strength', 'compound', 'pull', 'advanced', ARRAY['Begin with the atlas stone between your feet. Bend at the hips to wrap your arms vertically around the Atlas Stone, attempting to get your fingers underneath the stone. Many stones will have a small flat portion on the bottom, which will make the stone easier to hold.', 'Pulling the stone into your torso, drive through the back half of your feet to pull the stone from the ground.', 'As the stone passes the knees, lap it by sitting backward, pulling the stone on top of your thighs.', 'Sit low, getting the stone high onto your chest as you change your grip to reach over the stone. Stand, driving through with your hips. Close distance to the loading platform, and lean back, extending the hips to get the stone as high as possible.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'atlas-stones';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'adductors' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Atlas_Stones/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Atlas_Stones/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strongman';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Axle Deadlift', 'axle-deadlift', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['Approach the bar so that it is centered over your feet. You feet should be about hip width apart. Bend at the hip to grip the bar at shoulder width, allowing your shoulder blades to protract. Typically, you would use an over/under grip.', 'With your feet and your grip set, take a big breath and then lower your hips and flex the knees until your shins contact the bar. Look forward with your head, keep your chest up and your back arched, and begin driving through the heels to move the weight upward.', 'After the bar passes the knees, aggressively pull the bar back, pulling your shoulder blades together as you drive your hips forward into the bar.', 'Lower the bar by bending at the hips and guiding it to the floor.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'axle-deadlift';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Axle_Deadlift/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Axle_Deadlift/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strongman';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Backward Drag', 'backward-drag', NULL, v_category_id, 'strength', 'compound', 'pull', 'beginner', ARRAY['Load a sled with the desired weight, attaching a rope or straps to the sled that you can hold onto.', 'Begin the exercise by moving backwards for a given distance. Leaning back, extend through the legs for short steps to move as quickly as possible.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'backward-drag';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Backward_Drag/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Backward_Drag/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strongman';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Bear Crawl Sled Drags', 'bear-crawl-sled-drags', NULL, v_category_id, 'strength', 'compound', 'push', 'beginner', ARRAY['Wearing either a harness or a loose weight belt, attach the chain to the back so that you will be facing away from the sled. Bend down so that your hands are on the ground. Your back should be flat and knees bent. This is your starting position.', 'Begin by driving with legs, alternating left and right. Use your hands to maintain balance and to help pull. Try to keep your back flat as you move over a given distance.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'bear-crawl-sled-drags';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bear_Crawl_Sled_Drags/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Bear_Crawl_Sled_Drags/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strongman';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Car Deadlift', 'car-deadlift', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['This event apparatus typically has neutral grip handles, however some have a straight bar that you can approach like a normal deadlift. The apparatus can be loaded with a vehicle or other heavy objects such as tractor tires or kegs.', 'Center yourself between the handles if you are a strong squatter, or back a couple inches if you are a strong deadlifter. You feet should be about hip width apart. Bend at the hip to grip the handles. With your feet and your grip set, take a big breath and then lower your hips and flex the knees.', 'Look forward with your head, keep your chest up and your back arched, and begin driving through the heels to move the weight upward. As the weight comes up, pull your shoulder blades together as you drive your hips forward.', 'Lower the weight by bending at the hips and guiding it to the floor.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'car-deadlift';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Car_Deadlift/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Car_Deadlift/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strongman';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Circus Bell', 'circus-bell', NULL, v_category_id, 'strength', 'compound', 'push', 'advanced', ARRAY['The circus bell is an oversized dumbbell with a thick handle. Begin with the dumbbell between your feet, and grip the handle with both hands.', 'Clean the dumbbell by extending through your hips and knees to deliver the implement to the desired shoulder, letting go with the extra hand.', 'Ensure that you get one of the dumbbell heads behind the shoulder to keep from being thrown off balance. To raise it overhead, dip by flexing the knees, and the drive upwards as you extend the dumbbell overhead, leaning slightly away from it as you do so.', 'Carefully guide the bell back to the floor, keeping it under control as much as possible. It is best to perform this event on a thick rubber mat to prevent damage to the floor.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'circus-bell';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Circus_Bell/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Circus_Bell/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strongman';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Crucifix', 'crucifix', NULL, v_category_id, 'strength', 'isolation', 'static', 'beginner', ARRAY['In the crucifix, you statically hold weights out to the side for time. While the event can be practiced using dumbbells, it is best to practice with one of the various implements used, such as axes and hammers, as it feels different.', 'Begin standing, and raise your arms out to the side holding the implements. Your arms should be parallel to the ground. In competition, judges or sensors are used to let you know when you break parallel. Hold for as long as you can. Typically, the weights should be heavy enough that you fail in 30-60 seconds.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'crucifix';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Crucifix/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Crucifix/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strongman';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Forward Drag with Press', 'forward-drag-with-press', NULL, v_category_id, 'strength', 'compound', 'push', 'intermediate', ARRAY['Attach a dual handled chain or rope attachment to the sled. You should be facing away from the sled, holding a handle in each hand.', 'Begin the movement by moving forward for one step. Leaning forward, extend through the legs and hips to move, pausing with each step to extend through the elbows, pressing your hands forward. Step forward until you return to the start position prepared to press.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'forward-drag-with-press';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'chest' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'triceps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Forward_Drag_with_Press/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Forward_Drag_with_Press/1.jpg', 1);
+end $$;
+
+do $$
+declare v_exercise_id uuid; v_category_id uuid;
+begin
+  select id into v_category_id from public.exercise_categories where name = 'strongman';
+  insert into public.exercises (name, slug, description, category_id, exercise_type, mechanics, force, difficulty, instructions) values ('Keg Load', 'keg-load', NULL, v_category_id, 'strength', 'compound', 'pull', 'intermediate', ARRAY['To load kegs, place the desired number a distance from the loading platform, typically 30-50 feet.', 'Begin by grabbing the close handle of the first keg, tilting it onto its side to grab the opposite edge of the bottom of the keg. Lift the keg up to your chest.', 'The higher you can place the keg, the faster you should be able to move to the platform. Shouldering is usually not allowed. Be sure to keep a firm hold on the keg. Move as quickly as possible to the platform, and load it, extending through your hips, knees, and ankles to get it as high as possible.', 'Return to the starting position to retrieve the next keg, and repeat until the event is completed.']::text[]) on conflict (slug) do nothing returning id into v_exercise_id;
+  if v_exercise_id is null then
+    select id into v_exercise_id from public.exercises where slug = 'keg-load';
+  end if;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'primary' from public.muscle_groups where name = 'lower back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'abdominals' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'biceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'calves' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'forearms' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'glutes' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'hamstrings' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'middle back' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'quadriceps' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'shoulders' on conflict do nothing;
+  insert into public.exercise_muscles (exercise_id, muscle_group_id, role) select v_exercise_id, id, 'secondary' from public.muscle_groups where name = 'traps' on conflict do nothing;
+  insert into public.exercise_equipment (exercise_id, equipment_id) select v_exercise_id, id from public.equipment where name = 'Other' on conflict do nothing;
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Keg_Load/0.jpg', 0);
+  insert into public.exercise_images (exercise_id, url, display_order) values (v_exercise_id, 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/Keg_Load/1.jpg', 1);
+end $$;
