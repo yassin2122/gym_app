@@ -79,8 +79,7 @@ class _ForgotPasswordScreenState extends ConsumerState<ForgotPasswordScreen> {
           children: [
             const AuthHeader(
               title: 'Reset password',
-              subtitle:
-                  "Enter your email and we'll send you a reset link.",
+              subtitle: "Enter your email and we'll send you a reset link.",
             ),
             const SizedBox(height: AppSpacing.xl),
             AppTextField(
@@ -116,7 +115,7 @@ class _ForgotPasswordScreenState extends ConsumerState<ForgotPasswordScreen> {
             size: 64,
           ).animate().scale(duration: 300.ms, curve: Curves.easeOutBack),
           const SizedBox(height: AppSpacing.lg),
-          Text(
+          const Text(
             'Check your email',
             style: AppTypography.headline,
             textAlign: TextAlign.center,

@@ -10,17 +10,17 @@ class WorkoutsScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return AppScaffold(
+    return const AppScaffold(
       extendBodyBehindNav: true,
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const SizedBox(height: AppSpacing.lg),
-          const SectionTitle(
+          SizedBox(height: AppSpacing.lg),
+          SectionTitle(
             title: 'Workouts',
             subtitle: 'Plans and templates for your training',
           ),
-          const EmptyState(
+          EmptyState(
             icon: LucideIcons.clipboardList,
             title: 'No workout plans yet',
             message:

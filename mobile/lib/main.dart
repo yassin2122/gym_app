@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:go_router/go_router.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
 import 'core/constants/app_constants.dart';
 import 'core/routing/app_router.dart';
 import 'core/theme/app_theme.dart';
@@ -9,12 +9,26 @@ import 'core/theme/app_theme.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  await Supabase.initialize(
-    url: const String.fromEnvironment('SUPABASE_URL'),
-    anonKey: const String.fromEnvironment('SUPABASE_ANON_KEY'),
-  );
+  try {
+    await Supabase.initialize(
+      // Project URL (NOT /rest/v1/)
+      url: 'https://adskpshwfymknhvqjmlu.supabase.co',
 
-  runApp(const ProviderScope(child: GymApp()));
+      // Your Publishable (Anon) Key
+      anonKey: 'sb_publishable_t4QBrabFUAlV0HpsMO-Vdg_mtXROA-g',
+    );
+
+    debugPrint('✅ Supabase initialized successfully');
+  } catch (e, stackTrace) {
+    debugPrint('❌ Failed to initialize Supabase: $e');
+    debugPrintStack(stackTrace: stackTrace);
+  }
+
+  runApp(
+    const ProviderScope(
+      child: GymApp(),
+    ),
+  );
 }
 
 class GymApp extends ConsumerWidget {

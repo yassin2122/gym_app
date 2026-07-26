@@ -27,12 +27,11 @@ class StatisticsScreen extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
+                const Row(
                   children: [
-                    const Icon(LucideIcons.trendingUp,
-                        size: AppSizing.iconSm,
-                        color: AppColors.textTertiary),
-                    const SizedBox(width: AppSpacing.xxs),
+                    Icon(LucideIcons.trendingUp,
+                        size: AppSizing.iconSm, color: AppColors.textTertiary),
+                    SizedBox(width: AppSpacing.xxs),
                     Text('VOLUME TREND', style: AppTypography.caption),
                   ],
                 ),
@@ -44,7 +43,7 @@ class StatisticsScreen extends StatelessWidget {
                     color: AppColors.surfaceElevated,
                     borderRadius: BorderRadius.circular(AppRadius.md),
                   ),
-                  child: Text(
+                  child: const Text(
                     'Chart coming soon',
                     style: AppTypography.body,
                   ),
@@ -53,22 +52,21 @@ class StatisticsScreen extends StatelessWidget {
             ),
           ),
           const SizedBox(height: AppSpacing.md),
-          AppCard(
+          const AppCard(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Row(
                   children: [
-                    const Icon(LucideIcons.award,
-                        size: AppSizing.iconSm,
-                        color: AppColors.textTertiary),
-                    const SizedBox(width: AppSpacing.xxs),
+                    Icon(LucideIcons.award,
+                        size: AppSizing.iconSm, color: AppColors.textTertiary),
+                    SizedBox(width: AppSpacing.xxs),
                     Text('PERSONAL RECORDS', style: AppTypography.caption),
                   ],
                 ),
-                const SizedBox(height: AppSpacing.sm),
+                SizedBox(height: AppSpacing.sm),
                 Text('No records yet', style: AppTypography.title),
-                const SizedBox(height: AppSpacing.xxs),
+                SizedBox(height: AppSpacing.xxs),
                 Text(
                   'Log your first workout to start setting PRs.',
                   style: AppTypography.body,

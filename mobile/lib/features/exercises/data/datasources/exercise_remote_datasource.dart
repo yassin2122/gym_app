@@ -35,10 +35,10 @@ class ExerciseRemoteDataSource {
         query = query.ilike('name', '%${search.trim()}%');
       }
       if (primaryMuscles.isNotEmpty) {
-        query = query.in_('primary_muscle', primaryMuscles);
+        query = query.inFilter('primary_muscle', primaryMuscles);
       }
       if (equipment.isNotEmpty) {
-        query = query.in_('equipment', equipment);
+        query = query.inFilter('equipment', equipment);
       }
       if (exerciseType != null) {
         query = query.eq('exercise_type', exerciseType);

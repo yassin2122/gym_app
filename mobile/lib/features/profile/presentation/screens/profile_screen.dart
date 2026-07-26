@@ -41,12 +41,12 @@ class ProfileScreen extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: AppSpacing.md),
-                Expanded(
+                const Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text('Guest', style: AppTypography.title),
-                      const SizedBox(height: AppSpacing.xxs),
+                      SizedBox(height: AppSpacing.xxs),
                       Text(
                         'Your progress is only saved on this device',
                         style: AppTypography.body,
@@ -58,29 +58,29 @@ class ProfileScreen extends StatelessWidget {
             ),
           ),
           const SizedBox(height: AppSpacing.md),
-          AppCard(
+          const AppCard(
             color: AppColors.surfaceElevated,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Row(
                   children: [
-                    const Icon(LucideIcons.cloud,
+                    Icon(LucideIcons.cloud,
                         size: AppSizing.iconSm, color: AppColors.primary),
-                    const SizedBox(width: AppSpacing.xxs),
+                    SizedBox(width: AppSpacing.xxs),
                     Text('SYNC YOUR PROGRESS', style: AppTypography.caption),
                   ],
                 ),
-                const SizedBox(height: AppSpacing.sm),
+                SizedBox(height: AppSpacing.sm),
                 Text(
                   'Create an account to back up your workouts and access '
                   'them on any device.',
                   style: AppTypography.body,
                 ),
-                const SizedBox(height: AppSpacing.md),
+                SizedBox(height: AppSpacing.md),
                 // Placeholder-data screen — not wired to Auth this
                 // sprint, per scope.
-                const PrimaryButton(
+                PrimaryButton(
                   label: 'Create Account',
                   onPressed: null,
                 ),

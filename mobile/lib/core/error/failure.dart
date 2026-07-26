@@ -42,11 +42,10 @@ final class NetworkFailure extends Failure {
 }
 
 final class ServerFailure extends Failure {
-  const ServerFailure([String message = 'Something went wrong. Please try again.'])
-      : super(message);
+  const ServerFailure(
+      [super.message = 'Something went wrong. Please try again.']);
 }
 
 final class UnknownFailure extends Failure {
-  const UnknownFailure([String message = 'An unexpected error occurred.'])
-      : super(message);
+  const UnknownFailure([super.message = 'An unexpected error occurred.']);
 }

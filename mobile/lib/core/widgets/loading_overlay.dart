@@ -24,9 +24,9 @@ class LoadingOverlay extends StatelessWidget {
             child: AnimatedOpacity(
               opacity: isLoading ? 1 : 0,
               duration: const Duration(milliseconds: 150),
-              child: ColoredBox(
+              child: const ColoredBox(
                 color: AppColors.overlayScrim,
-                child: const Center(
+                child: Center(
                   child: CircularProgressIndicator(
                     color: AppColors.primary,
                   ),

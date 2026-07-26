@@ -11,19 +11,19 @@ class ExerciseCardSkeleton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return AppCard(
+    return const AppCard(
       child: Row(
         children: [
-          const LoadingSkeleton(
+          LoadingSkeleton(
             width: 64,
             height: 64,
             borderRadius: AppRadius.md,
           ),
-          const SizedBox(width: AppSpacing.md),
+          SizedBox(width: AppSpacing.md),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: const [
+              children: [
                 LoadingSkeleton(width: 160, height: 16),
                 SizedBox(height: AppSpacing.xs),
                 LoadingSkeleton(width: 100, height: 12),

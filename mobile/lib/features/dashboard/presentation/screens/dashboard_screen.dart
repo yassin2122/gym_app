@@ -51,21 +51,21 @@ class DashboardScreen extends StatelessWidget {
 class _TodaysWorkoutCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    return AppCard(
+    return const AppCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              const Icon(LucideIcons.calendar,
+              Icon(LucideIcons.calendar,
                   size: AppSizing.iconSm, color: AppColors.textTertiary),
-              const SizedBox(width: AppSpacing.xxs),
+              SizedBox(width: AppSpacing.xxs),
               Text('TODAY\'S WORKOUT', style: AppTypography.caption),
             ],
           ),
-          const SizedBox(height: AppSpacing.sm),
+          SizedBox(height: AppSpacing.sm),
           Text('No workout scheduled', style: AppTypography.title),
-          const SizedBox(height: AppSpacing.xxs),
+          SizedBox(height: AppSpacing.xxs),
           Text(
             'Create a plan to see it here before your next session.',
             style: AppTypography.body,
@@ -81,7 +81,7 @@ class _QuickStartCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return AppCard(
+    return const AppCard(
       color: AppColors.surfaceElevated,
       child: Row(
         children: [
@@ -90,7 +90,7 @@ class _QuickStartCard extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text('Quick Start', style: AppTypography.title),
-                const SizedBox(height: AppSpacing.xxs),
+                SizedBox(height: AppSpacing.xxs),
                 Text(
                   'Jump into an empty workout and log as you go.',
                   style: AppTypography.body,
@@ -98,7 +98,7 @@ class _QuickStartCard extends StatelessWidget {
               ],
             ),
           ),
-          const SizedBox(width: AppSpacing.md),
+          SizedBox(width: AppSpacing.md),
           SizedBox(
             width: 120,
             child: PrimaryButton(
@@ -118,21 +118,21 @@ class _RecentActivityCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return AppCard(
+    return const AppCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              const Icon(LucideIcons.activity,
+              Icon(LucideIcons.activity,
                   size: AppSizing.iconSm, color: AppColors.textTertiary),
-              const SizedBox(width: AppSpacing.xxs),
+              SizedBox(width: AppSpacing.xxs),
               Text('RECENT ACTIVITY', style: AppTypography.caption),
             ],
           ),
-          const SizedBox(height: AppSpacing.sm),
+          SizedBox(height: AppSpacing.sm),
           Text('No workouts logged yet', style: AppTypography.title),
-          const SizedBox(height: AppSpacing.xxs),
+          SizedBox(height: AppSpacing.xxs),
           Text(
             'Your completed workouts will show up here.',
             style: AppTypography.body,
